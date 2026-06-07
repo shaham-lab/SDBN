@@ -617,14 +617,13 @@ def load_adversarial_csv(output_dir, args, epoch_num=None):
         csv_filename = f"trainset_seed{args.seed}_sdbn_{suffix}.csv"
     
     if args.perturbation == 'sdbn-p':
-        # sdbn-p_data/{dataset}/trainset_{train_size}/ relative to --root or cwd
         if args.resource_dir:
-            base = args.resource_dir
+            # --resource_dir already points directly to the trainset directory
+            csv_path = os.path.join(args.resource_dir, csv_filename)
         else:
             root = args.root if args.root else os.getcwd()
-            base = os.path.join(root, 'sdbn-p_data', args.dataset)
-        train_size_str = args.train_size if args.train_size else 'full'
-        csv_path = os.path.join(base, f"trainset_{train_size_str}", csv_filename)
+            train_size_str = args.train_size if args.train_size else 'full'
+            csv_path = os.path.join(root, 'sdbn-p_data', args.dataset, f"trainset_{train_size_str}", csv_filename)
     else:
         # sdbn-p: keep loading from output_dir as before
         csv_path = os.path.join(output_dir, csv_filename)
