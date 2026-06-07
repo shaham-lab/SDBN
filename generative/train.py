@@ -1096,7 +1096,7 @@ def train_one_epoch(model, train_dataloader, optimizer, scheduler, device, epoch
 # CLI defaults
 # ----------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Seq2Seq fine-tuning with LoRA (JFLEG/E2E/WikiAuto/PersonaChat)")
+    p = argparse.ArgumentParser(description="SDBN-P generative fine-tuning with LoRA (SQuAD/TweetQA)")
 
     p.add_argument(
         '--perturbation', '-pt',
