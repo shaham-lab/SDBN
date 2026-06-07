@@ -109,9 +109,9 @@ Pre-generated adversarial CSV files are required (see [generative/README.md](gen
 If you use this code, please cite our paper:
 
 ```bibtex
-@article{sdbn2024,
+@article{sdbn2026,
   title={Small Data, Big Noise: Adversarial Training for Robust Parameter-Efficient Fine-Tuning},
-  author={...},
-  year={2024}
+  author={Eitan Cohen, Idan Simai, and Uri Shaham},
+  year={2026}
 }
 ```
