@@ -1,0 +1,298 @@
+#*Noise is diffenct scales*
+
+'''
+Evaluate model over Embedding augments
+'''
+import sys
+import torch
+from datasets import load_dataset, DatasetDict
+from transformers import BertTokenizer, BertForSequenceClassification, AutoTokenizer
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel
+from textattack.augmentation import EmbeddingAugmenter,CharSwapAugmenter
+from tqdm import tqdm
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from typing import Dict, List
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
+import utils
+import pandas as pd
+from peft import get_peft_model, LoraConfig, TaskType, set_peft_model_state_dict
+import re
+import argparse
+from os.path import join,exists
+
+
+
+MODELS = ['deberta']
+ALGS = ['adapter', 'bitfit', 'lora', 'qlora', 'full_ft']
+PERTUBATIONS = ['sdbn', 'sdbn-h']
+ds_map = {'banking77':'PolyAI/banking77',
+          'sst5':'SetFit/sst5',
+          'trec':'trec',
+          'news':"SetFit/20_newsgroups",
+          'bless':'bless'
+          }
+models_map = {'bert-b':'bert-base-uncased',
+              'deberta' : 'microsoft/deberta-v3-base',
+              'mbert' : 'bert-base-multilingual-uncased'}
+SEEDS = 5
+PERCENTS = ['percent_0.1']# ['percent_0.05']#
+rank = 4
+noise_levels = 5
+batch_size = 200
+label_numbers = {'banking77': 77, 'trec':50, 'ArSarcasm-v2':3, 'sst5':5, 'news':20, 'bless':6}
+import random
+
+
+
+def noise_data(victim, noise_level=1, noise_type=None): 
+    if noise_level < 1:
+        print("invalid noise_level: ",noise_level)
+        sys.exit(1)
+    embed_aug = EmbeddingAugmenter()
+    attacked_texts = []
+    labels = []
+    victim =  pd.DataFrame(victim)
+    for _, row in tqdm(victim.iterrows(), desc="Generating attacks", total=len(victim)):
+        attacked_text = row['text'] 
+        for _ in range(noise_level):
+            if noise_type == 'replace_word':
+                attacked_text = embed_aug.augment(attacked_text)[0]
+            elif noise_type == 'delete_word':
+                attacked_text = utils.delete_random_word(attacked_text)
+            elif noise_type == 'swap_word':
+                attacked_text = utils.swap_two_random_words(attacked_text)
+            elif noise_type == 'homophone':
+                attacked_text = utils.noise_homophones(attacked_text, p=0.2)
+            elif noise_type == 'sms':
+                attacked_text = utils.sms_chat_contraction_noise(attacked_text)
+            elif noise_type == 'cyrillic':
+                attacked_text = utils.cyrillic_homoglyph_noise(attacked_text)
+            elif noise_type == 'case':
+                attacked_text = utils.remove_cues_noise(attacked_text)
+            elif noise_type == 'pronoun_swap':
+                attacked_text = utils.pronoun_swap_noise(attacked_text)
+            elif noise_type == 'add_space':
+                attacked_text = utils.add_random_space(attacked_text)
+            elif noise_type == 'remove_space':
+                attacked_text = utils.remove_random_space(attacked_text)
+            elif noise_type == 'delete_char':
+                attacked_text = utils.delete_char(attacked_text)
+            elif noise_type == 'swap_char':
+                attacked_text = utils.swap_adj_chars(attacked_text)
+            elif noise_type == 'double_char':
+                attacked_text = utils.double_char(attacked_text)
+            elif noise_type == 'keyboard_char':
+                attacked_text = utils.keyboard_char(attacked_text)
+            else:
+                raise ValueError(f"Invalid noise type:{noise_type}")
+                exit(1)
+        attacked_texts.append(attacked_text)
+        labels.append(row['label'])
+        
+    attacked_df = pd.DataFrame({
+        'text': attacked_texts,
+        'label': labels
+    })
+    attacked_dataset = utils.SST5Dataset(attacked_df)
+    return attacked_dataset
+if __name__ == "__main__":
+
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--noise_type', '-nt', type=str, default=None, action='store', help='Set noise type')
+    parser.add_argument('--device', type=str, default='0', help='The device to run the program')
+    parser.add_argument('--noise_levels', type=int, default=noise_levels, help='The number of noise levels to test')
+    parser.add_argument('--dataset', type=str, default='banking77', help='The dataset to use')
+    parser.add_argument('--baseline', type=str, default=None, help='The baseline to use')
+    parser.add_argument('--dialect', type=str, default='', help='The dialect to use, only for ArSarcasm-v2')
+    parser.add_argument('--model', type=str, default='deberta', help='The model to use')
+    parser.add_argument('--pertubation', type=str, default=None, choices=['sdbn', 'sdbn-h'],
+                        help='Evaluate only this pertubation (default: all)')
+    parser.add_argument('--rank', type=int, default=4, help='LoRA/QLoRA rank')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs used')
+    parser.add_argument('--percent', type=float, default=0.1, help='Train set fraction used')
+    parser.add_argument('--seeds', type=int, default=SEEDS, help='Number of seeds (model files) expected per experiment')
+
+    args = parser.parse_args()
+
+    device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
+    SEEDS = args.seeds
+    if args.pertubation is not None:
+        PERTUBATIONS = [args.pertubation]
+    PERCENTS = [f'percent_{args.percent}']
+    rank = args.rank
+    DATASETS = [args.dataset]
+    if args.baseline is not None:
+        ALGS = [args.baseline]
+    for ds in DATASETS:
+        if ds == 'ArSarcasm-v2':
+            dataset_clean_raw = utils.get_ArSarcasm_testloader_sentiment_perdialect(args.dialect, batch_size)
+            model_name = 'bert-base-multilingual-uncased'
+            base_model = 'mbert'
+            tokenizer = BertTokenizer.from_pretrained(model_name)
+        elif ds == 'bless':
+            base_model = args.model
+            model_name = models_map[base_model]
+            tokenizer = AutoTokenizer.from_pretrained(models_map[base_model])
+            raw_dataset = load_dataset("json", data_files={
+                "train": "bless/bless_train.jsonl",
+                "validation": "bless/bless_val.jsonl",
+                "test": "bless/bless_test.jsonl",
+            })
+            train_label_set = set(raw_dataset['train']['relation'])
+            label_to_id = {label: idx for idx, label in enumerate(sorted(train_label_set))}
+            print(f"BLESS Label mapping: {label_to_id}")
+
+            def format_text_with_sep(examples):
+                return [f"{head} {tokenizer.sep_token} {tail}"
+                        for head, tail in zip(examples['head'], examples['tail'])]
+
+            train_texts = format_text_with_sep(raw_dataset['train'])
+            train_labels_int = [label_to_id[l] for l in raw_dataset['train']['relation'] if l in label_to_id]
+            test_texts_all = format_text_with_sep(raw_dataset['test'])
+            test_texts, test_labels_int = [], []
+            for i, label in enumerate(raw_dataset['test']['relation']):
+                if label in label_to_id:
+                    test_texts.append(test_texts_all[i])
+                    test_labels_int.append(label_to_id[label])
+            print(f"Train samples: {len(train_texts)}, Test samples: {len(test_texts)}")
+            dataset = DatasetDict({
+                'train': {'text': train_texts, 'label': train_labels_int},
+                'test': {'text': test_texts, 'label': test_labels_int}
+            })
+            dataset_clean_raw = dataset['test']
+        else:
+            base_model = args.model
+            model_name = models_map[base_model]
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if ds == 'banking77':
+                raw_dataset = load_dataset("csv", data_files={"train":"banking77/train.csv", "test":"banking77/test.csv"})
+                # Convert 'category' field to 'label' using the label map
+                dataset_clean_raw = DatasetDict({
+                                                'text': raw_dataset['test']['text'], 'label': [utils.BANKING77_LABEL_MAP[cat] for cat in raw_dataset['test']['category']]
+                                            })
+            elif ds == 'trec':
+                def load_trec_from_label_file(filepath):
+                    texts = []
+                    labels = []
+                    with open(filepath, 'r', encoding='latin-1') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                parts = line.split(' ', 1)
+                                if len(parts) == 2:
+                                    label, text = parts
+                                    labels.append(label)
+                                    texts.append(text)
+                    return texts, labels
+                test_texts, test_labels = load_trec_from_label_file("trec/test.label")
+                label_to_id = utils.TREC_LABEL_MAP
+                test_labels_int = [label_to_id[label] for label in test_labels]
+                dataset_clean_raw = {'text': test_texts, 'label': test_labels_int}
+            else:
+                dataset_clean_raw = load_dataset(ds_map[ds], split="test")
+            
+        dataset_clean = utils.SST5Dataset(pd.DataFrame(dataset_clean_raw))
+        for current_noise_level in range(1, args.noise_levels + 1):
+            print("NOISE LEVEL:", current_noise_level)
+            
+            dataset_noise = noise_data(dataset_clean_raw, current_noise_level, args.noise_type)
+            number_of_labels = label_numbers[ds]
+            
+            
+            for per in PERCENTS:
+                results_map = {}
+                
+                
+                #dataset_noise = utils.SST5Dataset(pd.DataFrame(dataset_noise))
+                for alg in ALGS:
+                    print(10*' * ')
+                    print("ALG:", alg)
+                    for permutation in PERTUBATIONS:
+                        alg_dir = f"{alg}_{permutation}"
+                        if ds == 'ArSarcasm-v2':
+                            dataset_key = ds + 'sentiment_egypt'
+                        else:
+                            dataset_key = ds
+                        output_dir = join('.', 'results', 'SDBN', f'Ep_{args.epochs}',
+                                         dataset_key, per, base_model, alg_dir, f'rank_{rank}')
+                        cln_list = []
+                        atk_list = []
+                        files = os.listdir(output_dir)
+                        models_files = []
+                        for f in files:
+                            if 'epoch_final.pt' in f:
+                                models_files.append(os.path.join(output_dir, f))
+                        if len(models_files) != SEEDS:
+                            print("ERROR: missed model in: ", output_dir)
+                            sys.exit(1)
+                        for model_path in models_files:
+                            match = re.search(r"seed(\d+)", model_path)
+                            seed = int(match.group(1))
+                            print("Seed number:", seed, model_path)
+                            utils.set_random_seed(seed)    
+
+                            if alg == 'lora':
+                                print("Loading LoRA model")
+                                model = utils.load_lora_model(model_path, number_of_labels, model_name=model_name, rank=rank)
+                                print("LoRA model loaded successfully")
+                                print(model_path)
+                            elif alg == 'qlora':
+                                model = utils.load_qlora_model(model_path, number_of_labels, model_name=model_name, rank=rank)
+                                print(model_path)
+                            elif alg == 'adapter':
+                                model = utils.load_adapter_model(model_path, number_of_labels, model_name=model_name)
+                                print(model_path)
+                            
+                            elif alg == 'bitfit':
+                                model = utils.load_bitfit_model(model_path, number_of_labels, model_name=model_name)
+                                print(model_path)
+                            elif alg == 'full_ft':
+                                model = utils.load_full_ft_model(model_path, number_of_labels, model_name=model_name)
+                                print(model_path)
+                            else:
+                                print("invalid alg")
+                                exit(1)
+                                break
+                            
+                                
+                                
+                            model = model.to(device)
+                            
+                            # Create dataloaders
+                            original_loader = DataLoader(dataset_clean, batch_size=batch_size, shuffle=False)
+                            torch.cuda.empty_cache()
+                            attacked_loader = DataLoader(dataset_noise, batch_size=batch_size, shuffle=False)
+                            torch.cuda.empty_cache()
+
+                        
+                            
+                            
+                            # Evaluate on original test set
+                            _, original_accuracy = utils.evaluate_model(model, original_loader, tokenizer)
+                            cln_list.append(original_accuracy)
+                            print(f" >>> for {alg} {ds} {permutation} Original Test Accuracy: {original_accuracy:.4f}")
+
+                            # Evaluate on attacked test set
+                            _, attacked_accuracy = utils.evaluate_model(model, attacked_loader, tokenizer)
+                            atk_list.append(attacked_accuracy)
+                            print(f"<<< for {alg} {ds} {permutation} Attacked Test Accuracy: {attacked_accuracy:.4f}")
+
+                        mean = np.mean(cln_list)
+                        std = np.std(cln_list)
+                        res = f"{mean:.2f}%-+{std:.2f}"
+                        results_map[f"{alg} {ds} {permutation} - clean test_set"] = res
+
+                        mean = np.mean(atk_list)
+                        std = np.std(atk_list)
+                        res = f"{mean:.2f}%-+{std:.2f}"
+                        results_map[f"{alg} {ds} {permutation} {per} - attack test_set"] = res
+
+                        torch.save(cln_list, os.path.join(output_dir, f"cln_list{args.dialect}_power_{current_noise_level}_{args.noise_type}.pt"))
+                        torch.save(atk_list, os.path.join(output_dir, f"atk_list{args.dialect}_power_{current_noise_level}_{args.noise_type}.pt"))
+                        
+                print("Res for: ", per, " noise_levels:", current_noise_level, " noise_type:", args.noise_type)
+                for key,val in results_map.items():
+                    print(key,":",val)

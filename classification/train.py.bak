@@ -1,0 +1,571 @@
+#train.py classification
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification,AutoTokenizer
+from peft import get_peft_model, LoraConfig, TaskType,LoraModel
+from datasets import load_dataset, DatasetDict
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import argparse
+import utils
+import os
+from torch.utils.data import random_split
+import time
+import numpy as np
+from collections import Counter
+
+device = None
+models_dict = {
+    'bert-b' : 'bert-base-uncased',
+    'llama' : 'meta-llama/Llama-2-7b-hf',
+    'mbert' : 'bert-base-multilingual-uncased',
+    'deberta' : 'microsoft/deberta-v3-base',
+    'deberta-l' : "microsoft/deberta-v3-large",
+    'mdeberta' : 'microsoft/mdeberta-v3-base'
+}
+
+def collate_fn(batch):
+    # batch is a list of ((premise, hyp), label)
+    pairs, labels = zip(*batch)
+    # pairs is a tuple of (premise, hyp) tuples → convert to list
+    return list(pairs), torch.tensor(labels, dtype=torch.long)
+
+if __name__ == "__main__":
+    
+    
+    parser = argparse.ArgumentParser()
+
+    # Dataset configuration
+    parser.add_argument('--dataset', type=str, default='banking77', action='store', help='dataset used for training')
+
+    # Training configuration
+    parser.add_argument('--batch_size', type=int, default=32, help='input batch size for training (default: 128)')
+    # ls_sst5 = 1e-5
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 1e-4)')
+
+    parser.add_argument('--epochs', type=int, default=10, help='number of local epochs')
+    parser.add_argument('--warm_up', type=int, default=3, help='')
+
+    # Model configuration
+    parser.add_argument('--alg', type=str, default='lora', help='PEFT routing strategy. Choose PEFT routing from : lora, bitfit')
+    parser.add_argument('--model', type=str, default='bert-b', help='neural network used in training (please refer to huggingface\'s model list')
+    parser.add_argument('--rank', type=int, default=12, help=' rank 12 for bert, 4 for deberta')
+
+    # Directory configuration conda activate torch37
+    #parser.add_argument('--logdir', type=str, default='./log/', help='dataset used for training')
+    parser.add_argument('--output', '-o', type=str, default='')
+    parser.add_argument('--modeldir', type=str, default='./save/', help='dataset used for training')
+
+    # Computation configuration
+    parser.add_argument('--device', type=str, default='0', help='The device to run the program')
+    parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
+    
+    parser.add_argument('--add_noise', default=False, action='store_true')
+    
+    parser.add_argument('--train_set_size', default=1.0, type=float, action='store')
+    
+    parser.add_argument('--public_server', '-ps', default=False, action='store_true')
+    
+    parser.add_argument('--norm' ,default=0, type=int, action='store' , help='norm p for perturb 0-inf\1\2')
+    
+    parser.add_argument('--epsilon', '-ep', type=float, default=5e-4, action='store', help='epislon size of adv example')
+    
+    parser.add_argument('--task', type=str, default='', action='store', help="Define the task for cases that dataset fits to more than one task")
+    
+    parser.add_argument('--no_msa', default=False, action='store_true', help="drop all the msa samples form ArSarcasm")
+
+    parser.add_argument('--target_layer', '-tl', default=None, type=int, action='store', help='Chose on which intermadiate layer to add the pertubation')
+    
+    parser.add_argument('--skip_test', '-st', default=False, action='store_true', help='skip checking performance on test set to finish training faster')
+    
+    parser.add_argument('--pertubation', '-pt', default=None, type=str, action='store', help='Chose pertubation type (sdbn, sdbn-s, sdbn-h, sdbn-pro, sdbn-pl, neftune)')
+    
+    parser.add_argument('--save_trainset', action='store_true', default=False,
+                        help='Save training dataset to CSV in output directory')
+    
+    
+    args = parser.parse_args()
+    print("Args:", args)
+    
+    
+    if args.add_noise:
+        mode = 'adv'
+    else:
+        mode = 'clean'
+        
+    if args.norm == 0:
+        norm_dir = ''   
+    else:
+        norm_dir = f"norm_{args.norm}"
+        
+        
+        
+        
+    if args.epsilon == 5e-4:
+        epsilon_dir = ''   
+    else:
+        epsilon_dir = f"eps_{args.epsilon}"
+    if args.no_msa:
+        msa='no_msa'
+    else:
+        msa=''  
+        
+    if args.rank == 12:
+        rank=''
+    else:
+        rank = f"rank_{args.rank}"
+        
+    if args.target_layer == None:
+        target = ''
+    else:
+        target = f"encoder_{args.target_layer}"
+        
+    if args.add_noise == False:
+        alg_dir = args.alg
+    else:
+        alg_dir = f"{args.alg}_{args.pertubation}"
+        
+    output_dir = os.path.join('.', 'results', 'ALoRA', norm_dir, epsilon_dir, args.dataset + args.task, f"percent_{args.train_set_size}", args.model, alg_dir, target, rank, msa, f"{args.add_noise}_noise", args.output)
+    if args.epochs != 10:
+        output_dir = os.path.join('.', 'results', 'ALoRA', norm_dir, epsilon_dir, f'Ep_{args.epochs}', args.dataset + args.task, f"percent_{args.train_set_size}", args.model, rank, alg_dir, target, msa,f"{args.add_noise}_noise", args.output)
+        
+    if args.public_server == True:
+        output_dir = os.path.join('.', 'results', 'ALoRA', norm_dir, epsilon_dir, f'Ep_{args.epochs}',args.dataset + args.task, f"percent_{args.train_set_size}", args.model, alg_dir, target, rank, msa, f"{args.add_noise}_noise", args.output)
+    print("output_dir:", output_dir)        
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir) 
+
+    
+    utils.set_random_seed(args.init_seed)
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    utils.device = device
+    
+    # Set up device
+    print(f"Using device: {device}")
+    
+    # Create tokenizer
+    if 'deberta' in args.model:
+        tokenizer = AutoTokenizer.from_pretrained(models_dict[args.model])
+    elif 'bert' in args.model:
+        # The above code is creating a tokenizer object using the `BertTokenizer` class from the
+        # Hugging Face Transformers library. It is loading a pre-trained tokenizer specified by the
+        # `args.model` argument from the `models_dict` dictionary.
+        tokenizer = BertTokenizer.from_pretrained(models_dict[args.model])
+    
+    
+    
+    accuracy_train_list = []    
+    accuracy_test_list = []
+    loss_train_list = []
+    loss_test_list = []
+    
+    print("\nLoading  dataset: ", args.dataset)
+    if args.dataset == 'sst5':
+        dataset = load_dataset("SetFit/sst5")
+    elif args.dataset == 'rot':
+        dataset = load_dataset("rotten_tomatoes")
+    elif args.dataset == 'banking77':
+        # Use data_files parameter to bypass the script issue
+        #dataset = load_dataset("csv", data_files={"train":"banking77/train.csv", "test":"banking77/test.csv"}) #load_dataset("PolyAI/banking77")
+        # Use data_files parameter to bypass the script issue
+        raw_dataset = load_dataset("csv", data_files={"train":"banking77/train.csv", "test":"banking77/test.csv"})
+            
+        # Convert 'category' field to 'label' using the label map
+        dataset = DatasetDict({
+            'train': {'text': raw_dataset['train']['text'], 'label': [utils.BANKING77_LABEL_MAP[cat] for cat in raw_dataset['train']['category']]},
+            'test': {'text': raw_dataset['test']['text'], 'label': [utils.BANKING77_LABEL_MAP[cat] for cat in raw_dataset['test']['category']]}
+        })
+        
+    elif args.dataset == 'nli':
+        from datasets import Dataset as HFDataset, DatasetDict as HFDatasetDict
+
+        # And if you’ve got a torch Dataset, alias it too:
+        from torch.utils.data import Dataset as TorchDataset
+        
+        
+        raw = load_dataset("nyu-mll/multi_nli")
+
+        # Filter splits
+        fiction_train = raw["train"].filter(lambda ex: ex["genre"] == "fiction")
+        fiction_val   = raw["validation_matched"].filter(lambda ex: ex["genre"] == "fiction")
+
+        # Build proper HF datasets
+        train_ds = HFDataset.from_dict({
+            "text": list(zip(fiction_train["premise"],
+                            fiction_train["hypothesis"])),
+            "label": fiction_train["label"]
+        })
+        val_ds = HFDataset.from_dict({
+            "text": list(zip(fiction_val["premise"],
+                            fiction_val["hypothesis"])),
+            "label": fiction_val["label"]
+        })
+
+        # Package into an HF DatasetDict
+        dataset = HFDatasetDict({
+            "train": train_ds,
+            "test": val_ds
+        })
+
+        
+    elif args.dataset == 'massive':
+        dataset = load_dataset("AmazonScience/massive", "en-US")
+        dataset= DatasetDict({
+                    'train': {'text': dataset['train']['utt'],'label': dataset['train']['intent']},
+                    'test': {'text': dataset['test']['utt'], 'label': dataset['test']['intent']}
+                            })
+    elif args.dataset == "trec":
+        # Load TREC dataset from local label files
+        def load_trec_from_label_file(filepath):
+            texts = []
+            labels = []
+            with open(filepath, 'r', encoding='latin-1') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        parts = line.split(' ', 1)  # Split on first space only
+                        if len(parts) == 2:
+                            label, text = parts
+                            labels.append(label)
+                            texts.append(text)
+            return texts, labels
+        
+        train_texts, train_labels = load_trec_from_label_file("trec/train.label")
+        test_texts, test_labels = load_trec_from_label_file("trec/test.label")
+        
+        # Use TREC_LABEL_MAP from utils
+        label_to_id = utils.TREC_LABEL_MAP
+        
+        train_labels_int = [label_to_id[label] for label in train_labels]
+        test_labels_int = [label_to_id[label] for label in test_labels]
+        
+        dataset = DatasetDict({
+                    'train': {'text': train_texts, 'label': train_labels_int},
+                    'test': {'text': test_texts, 'label': test_labels_int}
+                            })
+        
+        
+    elif args.dataset == "imdb":
+        dataset = load_dataset("imdb")
+    elif args.dataset == "news":
+        dataset = load_dataset("SetFit/20_newsgroups")
+    elif args.dataset == "ArSarcasm" or args.dataset == 'ArSarcasm-v2':
+        if args.dataset == 'ArSarcasm-v2':
+            version = 'v2'
+        else:
+            version = 'v1'
+        train_ds, test_ds = utils.get_ArSarcasm_ds(drop_msa=args.no_msa)
+        if args.task =='dialects':
+            dataset = DatasetDict({
+                'train': {'text': train_ds['tweet'], 'label' : train_ds['dialect']},
+                'test': {'text': test_ds['tweet'], 'label' : test_ds['dialect']}
+            })
+        elif args.task == 'sarcasm':
+            dataset = DatasetDict({
+                'train': {'text': train_ds['tweet'], 'label' : train_ds['sarcasm']},
+                'test': {'text': test_ds['tweet'], 'label' : test_ds['sarcasm']}
+            })
+        elif args.task == 'original_sentiment':
+            dataset = DatasetDict({
+                'train': {'text': train_ds['tweet'], 'label' : train_ds['original_sentiment']},
+                'test': {'text': test_ds['tweet'], 'label' : test_ds['original_sentiment']}
+            })
+        elif args.task == 'sentiment_egypt':
+            train_ds, test_ds = utils.get_ArSarcasm_ds(drop_msa=True,
+                                                       ignore_list_dialects=['levant', 
+                                                                             'magreb', 
+                                                                             'gulf',])
+            dataset = DatasetDict({
+                'train': {'text': train_ds['tweet'], 'label' : train_ds['sentiment']},
+                'test': {'text': test_ds['tweet'], 'label' : test_ds['sentiment']}
+            })
+        elif args.task == 'sentiment_levant':
+            train_ds, test_ds = utils.get_ArSarcasm_ds(drop_msa=True,
+                                                       ignore_list_dialects=['egypt', 
+                                                                             'magreb', 
+                                                                             'gulf',])
+            dataset = DatasetDict({
+                'train': {'text': train_ds['tweet'], 'label' : train_ds['sentiment']},
+                'test': {'text': test_ds['tweet'], 'label' : test_ds['sentiment']}
+            })
+    elif  args.dataset == 'yelp':
+        dataset = utils. get_yel_ds() #load_dataset("yelp_polarity", trust_remote_code=True)
+    
+    elif args.dataset == 'bless':
+        # Load the BLESS dataset
+        #raw_dataset = load_dataset("relbert/lexical_relation_classification", "BLESS")
+        raw_dataset = load_dataset(
+                            "json",
+                            data_files={
+                                "train": "bless/bless_train.jsonl",
+                                "validation": "bless/bless_val.jsonl",
+                                "test": "bless/bless_test.jsonl",
+                            },
+                        )
+        
+        
+        # Create label mapping based on TRAIN labels only
+        train_label_set = set(raw_dataset['train']['relation'])
+        label_to_id = {label: idx for idx, label in enumerate(sorted(train_label_set))}
+        
+        print(f"BLESS Label mapping: {label_to_id}")
+        
+        # Create text by combining head and tail with SEP token
+        def format_text_with_sep(examples):
+            texts = []
+            for head, tail in zip(examples['head'], examples['tail']):
+                # Format: "head [SEP] tail"  
+                text = f"{head} {tokenizer.sep_token} {tail}"
+                texts.append(text)
+            return texts
+        
+        # Convert string labels to integers using the mapping
+        def convert_labels_to_int(labels, label_mapping):
+            return [label_mapping[label] for label in labels if label in label_mapping]
+        
+        # Process train data
+        train_texts = format_text_with_sep(raw_dataset['train'])
+        train_labels_int = convert_labels_to_int(raw_dataset['train']['relation'], label_to_id)
+        
+        # Process test data - only include labels that exist in train
+        test_texts_all = format_text_with_sep(raw_dataset['test'])
+        test_labels_str = raw_dataset['test']['relation']
+        
+        # Filter test data to only include labels seen in training
+        test_texts = []
+        test_labels_int = []
+        for i, label in enumerate(test_labels_str):
+            if label in label_to_id:
+                test_texts.append(test_texts_all[i])
+                test_labels_int.append(label_to_id[label])
+        
+        print(f"Train samples: {len(train_texts)}, Test samples: {len(test_texts)}")
+        
+        # Create dataset dictionary in the same format as your other datasets
+        dataset = DatasetDict({
+            'train': {'text': train_texts, 'label': train_labels_int},
+            'test': {'text': test_texts, 'label': test_labels_int}
+        })
+             
+    else:
+        print("ERROR: invalid dataset")
+        exit(1)
+        
+    subset_df = pd.DataFrame(dataset['train']).sample(frac=args.train_set_size, random_state=args.init_seed)  # for reproducibility
+    train_data = utils.SST5Dataset(pd.DataFrame(subset_df))
+
+    # Save training dataset to CSV if requested
+    if args.save_trainset:
+        import csv
+        csv_filename = f"trainset_seed{args.init_seed}_{args.dataset + args.task}.csv"
+        csv_path = os.path.join(output_dir, csv_filename)
+        
+        print(f"\nSaving training dataset to: {csv_path}")
+        print(f"Dataset size: {len(train_data)} examples")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['text', 'category']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for idx in range(len(train_data)):
+                text, category = train_data[idx]
+                writer.writerow({
+                    'text': text,
+                    'category': category
+                })
+        
+        print(f"[✓] Training dataset saved to: {csv_path}")
+        print(f"    Format: CSV with columns ['text', 'label']")
+        print(f"    Total examples: {len(train_data)}")
+        exit(0)
+    
+ 
+    test_data = utils.SST5Dataset(pd.DataFrame(dataset['test']))
+
+    
+    
+    # Create data loaders
+    if args.dataset == 'nli':
+        train_loader = DataLoader(train_data,batch_size=args.batch_size,shuffle=True,num_workers=2,pin_memory=True, collate_fn=collate_fn)
+        test_loader = DataLoader(test_data,batch_size=args.batch_size,shuffle=False,num_workers=2,pin_memory=True, collate_fn=collate_fn)
+
+    else:
+        train_loader = DataLoader(train_data,batch_size=args.batch_size,shuffle=True,num_workers=2,pin_memory=True)
+        test_loader = DataLoader(test_data,batch_size=args.batch_size,shuffle=False,num_workers=2,pin_memory=True)
+
+    print(f"Dataset size: {len(train_data)} samples")
+    print(f"Number of batches: {len(train_loader)}")
+    
+    print(f"Dataset size: {len(test_data)} samples")
+    print(f"Number of batches: {len(test_loader)}")
+    
+    
+    # Create model
+    print("\nPreparing model")
+    number_of_labels = len(set(dataset["train"]["label"]))
+    print("number of classes:", number_of_labels)
+    
+    if args.model not in models_dict.keys():
+        print(f"ERROR: {args.model} wasn't found in models_dict")
+        exit(1)
+    print("perpare model:", args.model)
+    
+    if args.model == 'llama':
+        checkpointing_enable = True
+    else:
+        checkpointing_enable = False
+        
+    if args.alg == 'lora':
+        model = utils.prepare_model_for_lora(number_of_labels, models_dict[args.model], args.rank)
+    elif args.alg == 'qlora' or args.alg == 'neftune':
+        model = utils.prepare_model_for_qlora(number_of_labels, models_dict[args.model], args.rank)
+    elif args.alg == 'bitfit':
+        model = utils.prepare_model_for_bitfit(number_of_labels, models_dict[args.model])
+        args.lr = 1e-3
+    elif args.alg == 'adapter':
+        model = utils.prepare_model_for_adapter(number_of_labels, models_dict[args.model])
+    elif args.alg == 'prefix':
+        model = utils.prepare_model_for_prefix(number_of_labels, models_dict[args.model])
+    elif args.alg == 'prompt':
+        model = utils.prepare_model_for_prompt_tuning(number_of_labels, models_dict[args.model])
+    elif args.alg == 'full_ft':
+        model = utils.prepare_model_for_full_ft(number_of_labels, models_dict[args.model])
+    else:
+        print("ERROR: alg: {args.alg} wasn't found")
+        exit(1)
+        
+    print("---Args:", args)
+    
+    model = model.to(device)
+    print(model)
+    
+    # Count and display parameters
+    total_params, trainable_params = utils.count_parameters(model)
+    print("\nModel Parameters:")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters (LoRA only): {trainable_params:,}")
+    print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")
+    
+    # Set up optimizer (only training LoRA parameters)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    
+    # Now you can continue with your training loop...
+    # Your   function continues here...
+    
+    print("\nStarting training...")
+    print("Begin Warm Phase")
+    for warm_epoch in range(args.warm_up):
+        print("EPOCH: ", warm_epoch)
+        train_loss, test_loss, train_acc, test_acc, model,_,_ = utils.train_one_epoch(
+            model, train_loader, test_loader, tokenizer, optimizer, device,
+            checkpointing_enable=checkpointing_enable, alg=args.alg, skip_test=args.skip_test
+        )
+        
+        print("\nEpoch completed!")
+        print(f"Average train loss: {train_loss:.4f}")
+        print(f"Average test loss: {test_loss:.4f}")
+        print(f"Accuracy-Train: {train_acc:.2f}%")
+        print(f"Accuracy-Test: {test_acc:.2f}%")
+        loss_train_list.append(train_loss)
+        loss_test_list.append(test_loss)
+        accuracy_train_list.append(train_acc)
+        accuracy_test_list.append(test_acc)
+        
+    print("Finish Warm Phase")
+    
+    print("Begin Adv Phase")
+    
+    # Load adversarial variants for SDBN-PL
+    adversarial_variants = None
+    if args.add_noise and args.pertubation == 'sdbn-pl':
+        try:
+            adversarial_variants = utils.load_adversarial_csv_classification(
+                output_dir, args.init_seed, args.dataset + args.task
+            )
+            print(f"Loaded {len(adversarial_variants)} adversarial variants for SDBN-PL")
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            print("Please generate adversarial examples CSV file first.")
+            exit(1)
+    
+    forward_time = []
+    for epoch in range(args.epochs):
+        start_time = time.perf_counter()
+        
+        print("EPOCH: ", epoch + args.warm_up)
+        if args.add_noise:
+            adv_percent = 1.0
+        else:
+            adv_percent = 0
+        if args.target_layer == None:
+            train_loss, test_loss, train_acc, test_acc, model, timing, non_zero_vals = utils.train_one_epoch(
+                model, train_loader, test_loader, tokenizer, optimizer, device, 
+                adv_percent=adv_percent,alg=args.alg, checkpointing_enable=checkpointing_enable, 
+                norm=args.norm, epsilon=args.epsilon, skip_test=args.skip_test, pertubation=args.pertubation, 
+                non_zero_list=[] if args.pertubation == 'sdbn-pro' else None,
+                adversarial_variants=adversarial_variants
+            )
+            forward_time = forward_time + timing    
+        else:
+            train_loss, test_loss, train_acc, test_acc, model = utils.train_one_epoch_target_layer(
+                model,
+                args.target_layer,
+                train_loader,
+                test_loader,
+                tokenizer,
+                optimizer,
+                adv_percent=adv_percent,
+                epsilon=args.epsilon
+            )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        print(f"Elapsed time: {elapsed_ms:.2f} milliseconds")
+        print("\nEpoch completed!")
+        print(f"Average train loss: {train_loss:.4f}")
+        print(f"Average test loss: {test_loss:.4f}")
+        print(f"Accuracy-Train: {train_acc:.2f}%")
+        print(f"Accuracy-Test: {test_acc:.2f}%")
+        loss_train_list.append(train_loss)
+        loss_test_list.append(test_loss)
+        accuracy_train_list.append(train_acc)
+        accuracy_test_list.append(test_acc)
+        if args.pertubation == 'sdbn-pro':
+            non_zero_vals = non_zero_vals if isinstance(non_zero_vals, list) else []
+            most_common = Counter(non_zero_vals).most_common(40)
+            print("40 most common non-zero values (sdbn-pro):")
+            for val, count in most_common:
+                print(f"Value: {val}, Count: {count}")
+        
+   
+            
+    print("Finish Adv Phase")
+    elapsed_ms = np.mean(forward_time)
+    print(f"Mean Elapsed time: {elapsed_ms:.2f} milliseconds")        
+   
+        
+    
+    torch.save(loss_train_list, os.path.join(output_dir, f'loss_train_seed_{args.init_seed}_{mode}.pt'))
+    torch.save(loss_test_list, os.path.join(output_dir, f'loss_test_seed_{args.init_seed}_{mode}.pt'))
+    torch.save(accuracy_train_list, os.path.join(output_dir, f'acc_train_seed_{args.init_seed}_{mode}.pt'))
+    torch.save(accuracy_test_list, os.path.join(output_dir, f'acc_test_seed_{args.init_seed}_{mode}.pt'))
+    
+    
+    
+    if args.alg == 'lora':
+        utils.save_model_lora(model, output_dir, args.init_seed, args.dataset, mode)
+    elif args.alg == 'qlora' or args.alg == 'neftune':
+        utils.save_model_qlora(model, output_dir, args.init_seed, args.dataset, mode)
+    elif args.alg == 'bitfit':
+        utils.save_model_bitfit(model, output_dir, args.init_seed, args.dataset, mode)
+    elif args.alg == 'adapter':
+        utils.save_model_adapter(model, output_dir, args.init_seed, args.dataset, mode)
+    elif args.alg == 'prompt':
+        utils.save_model_prompt(model, output_dir,  args.init_seed, args.dataset, mode)
+    elif args.alg == 'prefix':
+        utils.save_model_prefix(model, output_dir,  args.init_seed, args.dataset, mode)
+    elif args.alg == 'full_ft':
+        utils.save_model_full_ft(model, output_dir, args.init_seed, args.dataset, mode)
+    
+    print("Fine Tune Done!")
+    
+   

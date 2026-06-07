@@ -1,0 +1,26 @@
+# Core deep learning
+torch>=2.0.0
+transformers==4.57.1
+peft==0.14.0
+accelerate==1.6.0
+bitsandbytes==0.45.5
+
+# Data
+datasets==4.4.1
+pandas==2.2.3
+numpy==1.23.5
+scipy==1.13.1
+
+# Evaluation
+sacrebleu==2.5.1
+scikit-learn==1.6.1
+evaluate==0.4.5
+
+# NLP utilities
+nltk==3.9.1
+spacy==3.7.2
+textattack==0.3.10
+adapters==1.2.0.dev0
+
+# General
+tqdm==4.67.1
