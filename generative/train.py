@@ -133,17 +133,6 @@ def load_lora_gen_model(model_path, model_name, lora_rank=4, device='cuda:0'):
     return model
 
 
-def get_embedding_layer(model):
-    if hasattr(model, 'base_model'):
-        base_model = model.base_model.model
-    else:
-        base_model = model
-    
-    if hasattr(base_model, 'get_input_embeddings'):
-        return base_model.get_input_embeddings()
-    else:
-        raise ValueError("Model type not supported for embedding extraction")
-
 def _get_core_seq2seq_model(model):
     core = model
     if hasattr(core, 'base_model'):
@@ -151,56 +140,6 @@ def _get_core_seq2seq_model(model):
     if hasattr(core, 'model'):
         core = core.model
     return core
-
-# ----------------------------
-# SMART Perturbation (from mt-dnn)
-# ----------------------------
-# ----------------------------
-# FreeLB Perturbation (Free Large-Batch adversarial training)
-# ----------------------------
-def _sdbn_step(base_tensor: torch.Tensor,
-               grad_tensor: torch.Tensor,
-               mask: torch.Tensor,
-               epsilon: float,
-               scaled: bool) -> torch.Tensor:
-    """
-    Shared SDBN helper.
-
-    base_tensor: representation to perturb (embeddings or encoder outputs) [B,T,D]
-    grad_tensor: gradient wrt base_tensor [B,T,D]
-    mask: optional mask [B,T,1] (e.g., attention or label mask). Can be None.
-    epsilon: base epsilon
-    scaled: if True, use NEFTune-style scaling by ||base|| / sqrt(d)
-    """
-    direction = torch.sign(grad_tensor)
-    if mask is not None:
-        direction = direction * mask.to(direction.dtype)
-
-    if not scaled:
-        step = epsilon * direction
-    else:
-        # NEFTune-style scaling: scale by embedding magnitude
-        d = direction.size(-1)
-        norm = base_tensor.detach().norm(p=2, dim=-1, keepdim=True)  # [B,T,1]
-        scale = norm / (d ** 0.5 + 1e-8)
-        step = epsilon * scale * direction
-
-    # --- Diagnostics: compare |x| and |δ| ---
-    with torch.no_grad():
-        base_abs_mean = base_tensor.detach().abs().mean().item()
-        base_abs_max = base_tensor.detach().abs().max().item()
-        delta_abs_mean = step.detach().abs().mean().item()
-        delta_abs_max = step.detach().abs().max().item()
-        rel = delta_abs_mean / (base_abs_mean + 1e-12) if base_abs_mean > 0 else 0.0
-        mode = "SDBN-S" if scaled else "SDBN"
-        '''
-        print(
-            f"[{mode}] |x| mean={base_abs_mean:.3e}, max={base_abs_max:.3e} | "
-            f"|δ| mean={delta_abs_mean:.3e}, max={delta_abs_max:.3e}, "
-            f"mean ratio={rel:.3e}"
-        )
-        '''
-    return (base_tensor + step).detach()
 
 # ----------------------------
 # Dataset container
@@ -772,115 +711,6 @@ def load_adversarial_csv(output_dir, args, epoch_num=None):
     if len(adversarial_variants) > 0:
         print(f"[DEBUG] Sample IDs with variants: {list(adversarial_variants.keys())[:10]}")
     return adversarial_variants
-
-# used for SQUad
-def select_max_loss_variant_squad(model, tokenizer, variants, device, is_decoder_only=True, 
-                           max_source_len=512, max_target_len=128, dataset='squad',
-                           greedy_prob=1.0, temperature=1.0):
-    """Select a variant using mixed strategy per call.
-    
-    Each call flips a coin:
-    - With probability greedy_prob: pick argmax loss (hardest variant)
-    - Otherwise: sample proportional to softmax(loss/temperature)
-    
-    This gives diversity within each epoch — some examples train on the hardest
-    variant, others sample from the loss distribution for broader coverage.
-    
-    Args:
-        model: The model to evaluate
-        tokenizer: Tokenizer
-        variants: List of (prompt_text, answer_text) tuples
-        device: Device to run on
-        is_decoder_only: Whether model is decoder-only
-        max_source_len: Maximum source sequence length
-        max_target_len: Maximum target sequence length
-        dataset: Dataset name ('squad' or 'samsum')
-        greedy_prob: Probability of greedy argmax selection (default 0.5)
-        temperature: Temperature for softmax sampling when not greedy (default 1.0)
-    
-    Returns:
-        Selected variant as (input_ids, attention_mask, labels) tensors, variant index
-    """
-    model.eval()
-    
-    # Compute loss for all variants
-    all_losses = []
-    all_encoded = []
-    
-    with torch.no_grad():
-        for var_idx, (prompt_text, answer_text) in enumerate(variants):
-            if is_decoder_only:
-                if dataset == 'samsum':
-                    prompt_with_connector = f"{prompt_text}\n"
-                else:
-                    prompt_with_connector = f"{prompt_text}\nAnswer: "
-                
-                prompt_enc = tokenizer(
-                    prompt_with_connector.rstrip(' '),
-                    add_special_tokens=True,
-                    return_tensors="pt"
-                )
-                actual_prompt_len = prompt_enc['input_ids'].shape[1]
-                
-                full_text = f"{prompt_with_connector}{answer_text}{tokenizer.eos_token}"
-                
-                encoded = tokenizer(
-                    full_text,
-                    max_length=max_source_len + max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                
-                labels = encoded['input_ids'].clone()
-                labels[:, :actual_prompt_len] = -100
-                labels[labels == tokenizer.pad_token_id] = -100
-            else:
-                encoded = tokenizer(
-                    prompt_text,
-                    max_length=max_source_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                target_encoded = tokenizer(
-                    answer_text,
-                    max_length=max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                labels = target_encoded['input_ids']
-            
-            outputs = model(
-                input_ids=encoded['input_ids'].to(device),
-                attention_mask=encoded['attention_mask'].to(device),
-                labels=labels.to(device),
-                return_dict=True
-            )
-            
-            all_losses.append(outputs.loss.item())
-            all_encoded.append({
-                'input_ids': encoded['input_ids'].to(device),
-                'attention_mask': encoded['attention_mask'].to(device),
-                'labels': labels.to(device)
-            })
-    
-    # Select variant: greedy or sampled (decided per call)
-    losses_tensor = torch.tensor(all_losses)
-    
-    if random.random() < greedy_prob:
-        best_idx = losses_tensor.argmax().item()
-        mode = f"greedy(loss={all_losses[best_idx]:.4f})"
-    else:
-        probs = torch.softmax(losses_tensor / temperature, dim=0)
-        best_idx = torch.multinomial(probs, 1).item()
-        mode = f"sampled(loss={all_losses[best_idx]:.4f},p={probs[best_idx]:.3f})"
-    
-    model.train()
-    
-    print(f"    [SDBN-PL] variant {best_idx}/{len(variants)-1} ({mode})")
-    
-    return all_encoded[best_idx], best_idx
-
-# for tweetqa
 # for tweetqa AND squad — unified, fair, with clean_prob support
 def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=True,
                             max_source_len=512, max_target_len=128, dataset='squad',
@@ -893,10 +723,8 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
     during the actual training forward pass.
 
     Supported datasets:
-        squad, adversarial_qa   – preprocess_squad_for_decoder style
-        tweetqa                 – preprocess_tweetqa_for_decoder style
-        samsum                  – decoder-only summarisation style
-        dart                    – data-to-text generation style
+        squad    – preprocess_squad_for_decoder style
+        tweetqa  – preprocess_tweetqa_for_decoder style
 
     Args:
         model:          The model (switched to eval internally, restored to train)
@@ -939,17 +767,9 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
                 labels = target_encoded['input_ids']
 
             else:
-                # ---- decoder-only: dataset-specific prompt construction ----
-                if dataset == 'samsum':
-                    # CSV stores prompt ending with "Summary:\n"
-                    prompt_with_answer = f"{prompt_text}\n{answer_text}{tokenizer.eos_token}"
-                elif dataset == 'dart':
-                    # CSV stores the triples; connector is newline
-                    prompt_with_answer = f"generate text: {prompt_text}\n{answer_text}{tokenizer.eos_token}"
-                else:
-                    # squad / adversarial_qa / tweetqa / subjqa
-                    # CSV stores "Context: …\nQuestion: …" or "Tweet: …\nQuestion: …"
-                    prompt_with_answer = f"{prompt_text}\nAnswer: {answer_text}{tokenizer.eos_token}"
+                # ---- decoder-only: prompt construction ----
+                # squad/tweetqa: "Context: …\nQuestion: …" or "Tweet: …\nQuestion: …"
+                prompt_with_answer = f"{prompt_text}\nAnswer: {answer_text}{tokenizer.eos_token}"
 
                 # ---- tokenise full sequence ----
                 encoded = tokenizer(
@@ -980,7 +800,7 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
                                inp_ids[0, 0].item() == tokenizer.bos_token_id)
                     prompt_len = (1 if has_bos else 0) + len(prompt_ids)
 
-                elif dataset in ('squad', 'adversarial_qa', 'subjqa'):
+                else:  # squad
                     # === MATCHES preprocess_squad_for_decoder EXACTLY ===
                     reconstructed_prompt = f"{prompt_text}\nAnswer: "
                     prompt_enc = tokenizer(
@@ -991,31 +811,6 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
                         return_tensors="pt",
                     )
                     prompt_len = prompt_enc['input_ids'].shape[1]
-
-                elif dataset == 'samsum':
-                    # === MATCHES preprocess_samsum_for_seq2seq (decoder) ===
-                    prompt_enc = tokenizer(
-                        prompt_text,
-                        add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_len,
-                        return_tensors="pt",
-                    )
-                    prompt_len = prompt_enc['input_ids'].shape[1] + 1  # +1 BOS
-
-                elif dataset == 'dart':
-                    dart_prompt = f"generate text: {prompt_text}\n"
-                    prompt_enc = tokenizer(
-                        dart_prompt,
-                        add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_len,
-                        return_tensors="pt",
-                    )
-                    prompt_len = prompt_enc['input_ids'].shape[1] + 1  # +1 BOS
-
-                else:
-                    raise ValueError(f"select_max_loss_variant: unsupported dataset '{dataset}'")
 
                 # ----------------------------------------------------------
                 # 3. Build labels – match each dataset's masking convention
@@ -1029,19 +824,9 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
                         if attn[0, i].item() == 1:
                             labels[0, i] = inp_ids[0, i]
 
-                elif dataset in ('squad', 'adversarial_qa', 'subjqa'):
+                else:  # squad
                     # === MATCHES preprocess_squad_for_decoder ===
                     # Uses pad_token_id check: masks EOS (since pad=eos)
-                    for i in range(prompt_len, inp_ids.shape[1]):
-                        if inp_ids[0, i].item() != tokenizer.pad_token_id:
-                            labels[0, i] = inp_ids[0, i]
-
-                elif dataset == 'samsum':
-                    for i in range(prompt_len, inp_ids.shape[1]):
-                        if inp_ids[0, i].item() != tokenizer.pad_token_id:
-                            labels[0, i] = inp_ids[0, i]
-
-                elif dataset == 'dart':
                     for i in range(prompt_len, inp_ids.shape[1]):
                         if inp_ids[0, i].item() != tokenizer.pad_token_id:
                             labels[0, i] = inp_ids[0, i]
@@ -1091,340 +876,6 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
     model.train()
     return all_encoded[best_idx], best_idx
 
-def select_max_loss_variant_without_proxy(model, tokenizer, variants, device, is_decoder_only=True, 
-                           max_source_len=512, max_target_len=128, dataset='squad'):
-    """Select the variant that maximizes cross-entropy loss.
-    
-    Evaluates each variant's loss directly and picks the hardest one.
-    This replaces the gradient-embedding alignment heuristic with exact loss,
-    giving more reliable selection of the most challenging variant.
-    
-    Args:
-        model: The model to evaluate
-        tokenizer: Tokenizer
-        variants: List of (prompt_text, answer_text) tuples
-        device: Device to run on
-        is_decoder_only: Whether model is decoder-only
-        max_source_len: Maximum source sequence length (from args.max_length)
-        max_target_len: Maximum target sequence length (from args.max_target_length)
-        dataset: Dataset name ('squad' or 'samsum')
-    
-    Returns:
-        Best variant as (input_ids, attention_mask, labels) tensors
-    """
-    model.eval()  # CHANGED: eval mode, no gradients needed
-    
-    best_score = -float('inf')
-    best_encoded = None
-    best_idx = 0
-    
-    # CHANGED: entire function replaced with simple loss evaluation loop
-    with torch.no_grad():
-        for var_idx, (prompt_text, answer_text) in enumerate(variants):
-            if is_decoder_only:
-                if dataset == 'samsum':
-                    prompt_with_connector = f"{prompt_text}\n"
-                else:
-                    prompt_with_connector = f"{prompt_text}\nAnswer: "
-                
-                # Tokenize prompt for boundary detection
-                prompt_enc = tokenizer(
-                    prompt_with_connector.rstrip(' '),
-                    add_special_tokens=True,
-                    return_tensors="pt"
-                )
-                actual_prompt_len = prompt_enc['input_ids'].shape[1]
-                
-                # Build full text (prompt + answer + EOS)
-                full_text = f"{prompt_with_connector}{answer_text}{tokenizer.eos_token}"
-                
-                encoded = tokenizer(
-                    full_text,
-                    max_length=max_source_len + max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                
-                # Create labels (mask out prompt portion)
-                labels = encoded['input_ids'].clone()
-                labels[:, :actual_prompt_len] = -100
-                # Match clean-path: mask pad/EOS tokens
-                labels[labels == tokenizer.pad_token_id] = -100
-            else:
-                # For seq2seq models
-                encoded = tokenizer(
-                    prompt_text,
-                    max_length=max_source_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                target_encoded = tokenizer(
-                    answer_text,
-                    max_length=max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                labels = target_encoded['input_ids']
-            
-            # CHANGED: direct loss evaluation instead of gradient-embedding alignment
-            outputs = model(
-                input_ids=encoded['input_ids'].to(device),
-                attention_mask=encoded['attention_mask'].to(device),
-                labels=labels.to(device),
-                return_dict=True
-            )
-            score = outputs.loss.item()
-            
-            if score > best_score:
-                best_score = score
-                best_idx = var_idx
-                best_encoded = {
-                    'input_ids': encoded['input_ids'].to(device),
-                    'attention_mask': encoded['attention_mask'].to(device),
-                    'labels': labels.to(device)
-                }
-    
-    # Restore training mode
-    model.train()
-    
-    if best_encoded is None:
-        raise ValueError("No valid variant found")
-    
-    return best_encoded, best_idx
-# with proxy emmedding; for smasum, failed
-def select_max_loss_variant_with_proxy(model, tokenizer, variants, device, is_decoder_only=True, 
-                           max_source_len=512, max_target_len=128, dataset='squad'):
-    """Select the variant that maximizes gradient-embedding alignment: max <g_x, |E(x) - E(x_i)|>
-    
-    Similar to SDBN-H hotflip approach: compute gradient w.r.t. embeddings of original input,
-    then select variant whose embedding difference has maximum dot product with gradient.
-    
-    Args:
-        model: The model to evaluate
-        tokenizer: Tokenizer
-        variants: List of (prompt_text, answer_text) tuples
-        device: Device to run on
-        is_decoder_only: Whether model is decoder-only
-        max_source_len: Maximum source sequence length (from args.max_length)
-        max_target_len: Maximum target sequence length (from args.max_target_length)
-        dataset: Dataset name ('squad' or 'samsum')
-    
-    Returns:
-        Best variant as (input_ids, attention_mask, labels) tensors
-    """
-    model.train()  # Need train mode to compute gradients
-    
-    # Zero gradients before variant selection to avoid interfering with training
-    model.zero_grad()
-    
-    # Get original input (first variant is the clean input from CSV)
-    orig_prompt, orig_answer = variants[0]
-    
-    # Prepare original input with correct formatting matching save_trainset
-    if is_decoder_only:
-        if dataset == 'samsum':
-            # CSV format: "Dialogue:\n{dialogue}\n\nSummary:"
-            # Already has "Summary:" suffix, just add newline connector
-            prompt_with_connector = f"{orig_prompt}\n"
-        else:
-            # SQuAD CSV format: "Context: {context}\nQuestion: {question}"
-            # Need to add "Answer: " suffix
-            prompt_with_connector = f"{orig_prompt}\nAnswer: "
-        
-        # Tokenize prompt WITH special tokens to match clean-path boundary.
-        # rstrip(' ') mirrors preprocess_squad_for_decoder: trailing space in
-        # "Answer: " merges with the first answer token (e.g. "▁Denver"), so
-        # stripping it gives the correct boundary without counting it as a
-        # prompt token.
-        prompt_encoded = tokenizer(
-            prompt_with_connector.rstrip(' '),
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        prompt_len_orig = prompt_encoded['input_ids'].shape[1]
-        
-        full_text = f"{prompt_with_connector}{orig_answer}{tokenizer.eos_token}"
-        
-        encoded_orig = tokenizer(
-            full_text,
-            max_length=max_source_len + max_target_len,
-            truncation=True,
-            return_tensors="pt"
-        ).to(device)
-        
-        # Create labels for original
-        labels_orig = encoded_orig['input_ids'].clone()
-        labels_orig[:, :prompt_len_orig] = -100
-        # Match clean-path (preprocess_squad_for_decoder): mask EOS token
-        # (LLaMA sets pad_token=eos_token, so clean path masks EOS via pad check)
-        labels_orig[labels_orig == tokenizer.eos_token_id] = -100
-    else:
-        # For seq2seq models
-        encoded_orig = tokenizer(
-            orig_prompt,
-            max_length=max_source_len,
-            truncation=True,
-            return_tensors="pt"
-        ).to(device)
-        target_encoded = tokenizer(
-            orig_answer,
-            max_length=max_target_len,
-            truncation=True,
-            return_tensors="pt"
-        )
-        labels_orig = target_encoded['input_ids'].to(device)
-    
-    # Get embeddings for original input and compute gradient
-    input_ids_orig = encoded_orig['input_ids']
-    attention_mask_orig = encoded_orig['attention_mask']
-    
-    # Get embedding layer
-    if is_decoder_only:
-        embedding_layer = model.get_base_model().model.embed_tokens
-    else:
-        embedding_layer = model.get_base_model().encoder.embed_tokens
-    
-    # Compute embeddings with gradient
-    embeddings_orig = embedding_layer(input_ids_orig)
-    embeddings_orig.requires_grad_(True)
-    
-    # Forward pass to compute loss and gradient
-    if is_decoder_only:
-        outputs = model(
-            inputs_embeds=embeddings_orig,
-            attention_mask=attention_mask_orig,
-            labels=labels_orig.to(device),
-            return_dict=True
-        )
-    else:
-        # For seq2seq, need to handle encoder embeddings differently
-        encoder_outputs = model.get_encoder()(
-            inputs_embeds=embeddings_orig,
-            attention_mask=attention_mask_orig,
-            return_dict=True
-        )
-        outputs = model(
-            encoder_outputs=encoder_outputs,
-            labels=labels_orig,
-            return_dict=True
-        )
-    
-    loss = outputs.loss
-    grad_embeddings = torch.autograd.grad(loss, embeddings_orig, retain_graph=False, create_graph=False)[0]
-    grad_embeddings = grad_embeddings.detach()
-    embeddings_orig = embeddings_orig.detach()
-    
-    # FAIR-FIGHT FIX: Standardize prompt lengths to ensure fair variant comparison
-    # Step 1: Tokenize all prompts (without answers) to find max prompt length
-    prompt_info = []  # List of (prompt_with_connector, actual_prompt_len)
-    max_prompt_len = 0
-    
-    for prompt_text in [v[0] for v in variants]:
-        if is_decoder_only:
-            if dataset == 'samsum':
-                prompt_with_connector = f"{prompt_text}\n"
-            else:
-                prompt_with_connector = f"{prompt_text}\nAnswer: "
-            
-            # Tokenize prompt WITH special tokens, rstrip(' ') to match
-            # clean-path boundary (trailing space merges with first answer token)
-            prompt_enc = tokenizer(
-                prompt_with_connector.rstrip(' '),
-                add_special_tokens=True,
-                return_tensors="pt"
-            )
-            actual_prompt_len = prompt_enc['input_ids'].shape[1]
-            max_prompt_len = max(max_prompt_len, actual_prompt_len)
-            prompt_info.append((prompt_with_connector, actual_prompt_len))
-        else:
-            # For seq2seq, prompts are handled separately in encoder
-            prompt_info.append((prompt_text, len(tokenizer.encode(prompt_text, add_special_tokens=False))))
-            max_prompt_len = max(max_prompt_len, len(prompt_info[-1][1]))
-    
-    # Now evaluate all variants with fair prompt length standardization
-    best_score = -float('inf')
-    best_encoded = None
-    best_idx = 0
-    
-    with torch.no_grad():
-        for var_idx, (prompt_text, answer_text) in enumerate(variants):
-            if is_decoder_only:
-                # Use stored prompt info
-                prompt_with_connector, actual_prompt_len = prompt_info[var_idx]
-                
-                # Build full text (prompt + answer + EOS)
-                full_text = f"{prompt_with_connector}{answer_text}{tokenizer.eos_token}"
-                
-                encoded = tokenizer(
-                    full_text,
-                    max_length=max_source_len + max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                
-                # Create labels (mask out prompt portion)
-                labels = encoded['input_ids'].clone()
-                labels[:, :actual_prompt_len] = -100
-                # Match clean-path: mask EOS token in answer portion
-                labels[labels == tokenizer.eos_token_id] = -100
-            else:
-                # For seq2seq models
-                encoded = tokenizer(
-                    prompt_text,
-                    max_length=max_source_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                target_encoded = tokenizer(
-                    answer_text,
-                    max_length=max_target_len,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                labels = target_encoded['input_ids']
-            
-            # Get embeddings for variant
-            input_ids_var = encoded['input_ids'].to(device)
-            embeddings_var = embedding_layer(input_ids_var)
-            
-            # Score on PROMPT tokens — this is where SDBN-PL variants actually differ.
-            # Variants share the same answer text, so answer token embeddings are
-            # identical (context-free lookup table) → emb_diff=0 in answer region.
-            # The question paraphrase changes prompt tokens → non-zero emb_diff there.
-            if is_decoder_only:
-                actual_prompt_len_var = prompt_info[var_idx][1]
-                min_prompt_len = min(actual_prompt_len_var, prompt_len_orig)
-                emb_diff = embeddings_var[:, :min_prompt_len, :] - embeddings_orig[:, :min_prompt_len, :]
-                grad_to_use = grad_embeddings[:, :min_prompt_len, :]
-                score = torch.sum(grad_to_use * emb_diff).item()
-            else:
-                # For seq2seq, use target embeddings directly
-                emb_diff = embeddings_var - embeddings_orig
-                score = torch.sum(grad_embeddings * emb_diff).item()
-            
-            # Select variant with maximum score
-            if score > best_score:
-                best_score = score
-                best_idx = var_idx
-                best_encoded = {
-                    'input_ids': encoded['input_ids'].to(device),
-                    'attention_mask': encoded['attention_mask'].to(device),
-                    'labels': labels.to(device)
-                }
-            
-            # Clear cache after each variant evaluation
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-    
-    # Zero gradients after variant selection to ensure clean state for training
-    model.zero_grad()
-    
-    model.train()  # Ensure training mode
-    
-    if best_encoded is None:
-        raise ValueError("No valid variant found for gradient-embedding alignment")
-    
-    return best_encoded, best_idx
 
 # ----------------------------
 # Training step
@@ -1553,7 +1004,6 @@ def train_one_epoch(model, train_dataloader, optimizer, scheduler, device, epoch
             # Print statistics for every batch
             print(f"[SDBN-PL batch {batch_idx}] Adversarial: {adv_count}/{adv_count+fallback_count}, Fallback: {fallback_count}")
             
-            # Use fixed max length for fair comparison with vanilla/NEFTune
             max_len = max_source_len + max_target_len
             pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
             
@@ -1880,85 +1330,7 @@ if __name__ == "__main__":
     if hasattr(val_examples, 'shuffle'):
         fixed_val_eval = val_examples.select(range(min(args.fixed_val_size, len(val_examples))))
 
-    if args.dataset == "jfleg":
-        tr_data = preprocess_jfleg_for_seq2seq(
-            train_examples, tokenizer,
-            max_source_len=args.max_length, max_target_len=args.max_target_length,
-            train_multi_ref=args.train_multi_ref, refs_per_ex=args.refs_per_ex,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_jfleg_for_seq2seq(
-            val_examples, tokenizer,
-            max_source_len=args.max_length, max_target_len=args.max_target_length,
-            train_multi_ref=False,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = JFLEGDataset(tr_data)
-        val_ds = JFLEGDataset(va_data)
-    elif args.dataset == "e2e_nlg":
-        tr_data = preprocess_e2e_for_seq2seq(
-            train_examples, tokenizer, args.max_length, args.max_target_length,
-            train_multi_ref=args.train_multi_ref, refs_per_ex=args.refs_per_ex,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_e2e_for_seq2seq(
-            val_examples, tokenizer, args.max_length, args.max_target_length,
-            train_multi_ref=False,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = E2ENLGDataset(tr_data)
-        val_ds = E2ENLGDataset(va_data)
-    elif args.dataset == "dart":
-        tr_data = preprocess_dart_for_seq2seq(
-            train_examples, tokenizer, args.max_length, args.max_target_length,
-            train_multi_ref=args.train_multi_ref, refs_per_ex=args.refs_per_ex,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_dart_for_seq2seq(
-            val_examples, tokenizer, args.max_length, args.max_target_length,
-            train_multi_ref=False,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = DARTDataset(tr_data)
-        val_ds = DARTDataset(va_data)
-    elif args.dataset == "wiki_auto":
-        tr_data = preprocess_wiki_auto_for_seq2seq(train_examples, tokenizer, args.max_length, 128)
-        va_data = preprocess_wiki_auto_for_seq2seq(val_examples, tokenizer, args.max_length, 128)
-        train_ds = WikiAutoDataset(tr_data)
-        val_ds = WikiAutoDataset(va_data)
-    elif args.dataset == "personachat":
-        tr_data = preprocess_personachat_for_seq2seq(
-            train_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            max_hist_turns=3,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_personachat_for_seq2seq(
-            val_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            max_hist_turns=3,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = PersonaChatDataset(tr_data)
-        val_ds = PersonaChatDataset(va_data)
-    elif args.dataset == "gsm8k":
-        tr_data = preprocess_gsm8k_for_seq2seq(
-            train_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_gsm8k_for_seq2seq(
-            val_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = GSM8KDataset(tr_data)
-        val_ds = GSM8KDataset(va_data)
-    elif args.dataset in ["squad", "adversarial_qa", "subjqa"]:
+    if args.dataset in ["squad"]:
         if not is_decoder_only:
             raise ValueError("SQuAD-style QA datasets currently only support decoder-only models (LLaMA)")
         tr_data = preprocess_squad_for_decoder(
@@ -1971,29 +1343,8 @@ if __name__ == "__main__":
             max_source_len=args.max_length,
             max_target_len=args.max_target_length
         )
-        if args.dataset == "squad":
-            qa_dataset_cls = SQuADDataset
-        elif args.dataset == "adversarial_qa":
-            qa_dataset_cls = AdversarialQADataset
-        else:
-            qa_dataset_cls = SubjQADataset
-        train_ds = qa_dataset_cls(tr_data)
-        val_ds = qa_dataset_cls(va_data)
-    elif args.dataset == "samsum":
-        tr_data = preprocess_samsum_for_seq2seq(
-            train_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            is_decoder_only=is_decoder_only
-        )
-        va_data = preprocess_samsum_for_seq2seq(
-            val_examples, tokenizer,
-            max_source_len=args.max_length,
-            max_target_len=args.max_target_length,
-            is_decoder_only=is_decoder_only
-        )
-        train_ds = SAMSumDataset(tr_data)
-        val_ds = SAMSumDataset(va_data)
+        train_ds = SQuADDataset(tr_data)
+        val_ds = SQuADDataset(va_data)
     elif args.dataset == "tweetqa":
         if not is_decoder_only:
             raise ValueError("TweetQA currently only supports decoder-only models (LLaMA)")
@@ -2034,67 +1385,16 @@ if __name__ == "__main__":
             writer = csv.writer(f)
             
             # Write header based on dataset type
-            if args.dataset in ["squad", "adversarial_qa", "subjqa"]:
+            if args.dataset == "squad":
                 writer.writerow(["input", "answer"])
                 for ex in train_examples:
                     context = (ex.get("context") or "").strip()
                     question = (ex.get("question") or "").strip()
-                    # Combine context and question into single input column
                     input_text = f"Context: {context}\nQuestion: {question}"
                     answers = ex.get("answers") or {}
                     answer_texts = answers.get("text", [])
                     answer = answer_texts[0].strip() if answer_texts else ""
                     writer.writerow([input_text, answer])
-            
-            elif args.dataset == "jfleg":
-                writer.writerow(["input", "target"])
-                for ex in train_examples:
-                    src = (ex.get("sentence") or "").strip()
-                    refs = ex.get("corrections") or []
-                    tgt = refs[0].strip() if refs else ""
-                    writer.writerow([src, tgt])
-            
-            elif args.dataset == "e2e_nlg":
-                writer.writerow(["input", "target"])
-                for ex in train_examples:
-                    src, refs = _extract_e2e_source_and_refs(ex)
-                    tgt = refs[0] if refs else ""
-                    writer.writerow([src, tgt])
-            
-            elif args.dataset == "wiki_auto":
-                writer.writerow(["input", "target"])
-                for ex in train_examples:
-                    src = (ex.get("source") or ex.get("source_text") or "").strip()
-                    tgt = (ex.get("target") or ex.get("target_text") or "").strip()
-                    writer.writerow([src, tgt])
-            
-            elif args.dataset == "personachat":
-                writer.writerow(["persona", "history", "response"])
-                for ex in train_examples:
-                    persona = ex.get("personality", [])
-                    persona_str = " ".join(persona).strip() if persona else ""
-                    history = ex.get("history", [])
-                    history_str = " | ".join(history[-3:]) if history else ""
-                    candidates = ex.get("candidates", [])
-                    response = candidates[-1].strip() if candidates else ""
-                    writer.writerow([persona_str, history_str, response])
-            
-            elif args.dataset == "gsm8k":
-                writer.writerow(["question", "answer"])
-                for ex in train_examples:
-                    question = (ex.get("question") or "").strip()
-                    answer = (ex.get("answer") or "").strip()
-                    writer.writerow([question, answer])
-            
-            elif args.dataset == "samsum":
-                writer.writerow(["input", "answer"])
-                for ex in train_examples:
-                    dialogue = (ex.get("dialogue") or "").strip()
-                    summary = (ex.get("summary") or "").strip()
-                    # Format input as the full prompt (matching training format)
-                    input_text = f"Dialogue:\n{dialogue}\n\nSummary:\n"
-                    writer.writerow([input_text, summary])
-                    
             elif args.dataset == "tweetqa":
                 writer.writerow(["input", "answer"])
                 for ex in train_examples:
@@ -2131,79 +1431,7 @@ if __name__ == "__main__":
     print("\nOptimization setup:")
     print(f"  LR: {lr} | total_steps: {total_steps} | warmup_steps: {warmup_steps} | steps/epoch: {len(train_loader)}")
 
-    if args.dataset == "jfleg" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        print("INITIAL EVALUATION (GLEU, before training)")
-        print("="*60)
-        try:
-            initial_gleu = evaluate_jfleg_gleu(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(200, len(fixed_val_eval)), debug=True, is_decoder_only=is_decoder_only
-            )
-            print(f"Initial GLEU: {initial_gleu:.2f}")
-        except Exception as e:
-            print(f"[warn] Initial GLEU skipped: {e}")
-    elif args.dataset == "e2e_nlg" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        print("INITIAL EVALUATION (BLEU, before training)")
-        print("="*60)
-        try:
-            initial_bleu = evaluate_e2e_bleu(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(100, len(fixed_val_eval)), debug=True
-            )
-            print(f"Initial BLEU: {initial_bleu:.2f}")
-        except Exception as e:
-            print(f"[warn] Initial BLEU skipped: {e}")
-    elif args.dataset == "dart" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        print("INITIAL EVALUATION (BLEU, before training)")
-        print("="*60)
-        try:
-            initial_bleu = evaluate_dart_bleu(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(100, len(fixed_val_eval)), debug=True
-            )
-            print(f"Initial BLEU: {initial_bleu:.2f}")
-        except Exception as e:
-            print(f"[warn] Initial BLEU skipped: {e}")
-    elif args.dataset == "personachat" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        if args.f1_only:
-            print("INITIAL EVALUATION (F1 only, before training)")
-        else:
-            print("INITIAL EVALUATION (BLEU + F1, before training)")
-        print("="*60)
-        try:
-            initial_bleu, initial_f1 = evaluate_personachat_bleu(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(200, len(fixed_val_eval)), max_hist_turns=3, 
-                debug=True, is_decoder_only=is_decoder_only, f1_only=args.f1_only
-            )
-            if args.f1_only:
-                print(f"Initial F1: {initial_f1:.2f} (BLEU skipped)")
-            else:
-                print(f"Initial BLEU: {initial_bleu:.2f} | F1: {initial_f1:.2f}")
-        except Exception as e:
-            print(f"[warn] Initial evaluation skipped: {e}")
-    elif args.dataset == "gsm8k" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        print("INITIAL EVALUATION (EM, before training)")
-        print("="*60)
-        try:
-            initial_em = evaluate_gsm8k_em(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(200, len(fixed_val_eval)), debug=True, is_decoder_only=is_decoder_only
-            )
-            print(f"Initial EM: {initial_em:.2f}")
-        except Exception as e:
-            print(f"[warn] Initial EM skipped: {e}")
-    elif args.dataset in ["squad", "adversarial_qa", "subjqa"] and not args.skip_all_eval:
+    if args.dataset == "squad" and not args.skip_all_eval:
         print("\n" + "="*60)
         print("INITIAL EVALUATION (EM + F1, before training)")
         print("="*60)
@@ -2212,25 +1440,11 @@ if __name__ == "__main__":
                 model, tokenizer, fixed_val_eval,
                 max_src_len=args.max_length, max_gen_len=args.max_target_length,
                 num_samples=min(200, len(fixed_val_eval)), debug=True,
-                dataset_name="AdversarialQA" if args.dataset == "adversarial_qa" else "SQuAD"
+                dataset_name="SQuAD"
             )
             print(f"Initial EM: {initial_em:.2f}%, F1: {initial_f1:.2f}%")
         except Exception as e:
             print(f"[warn] Initial evaluation skipped: {e}")
-    elif args.dataset == "samsum" and not args.skip_all_eval:
-        print("\n" + "="*60)
-        print("INITIAL EVALUATION (ROUGE, before training)")
-        print("="*60)
-        try:
-            initial_r1, initial_r2, initial_rL = evaluate_samsum_rouge(
-                model, tokenizer, fixed_val_eval,
-                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                num_samples=min(200, len(fixed_val_eval)), debug=True, is_decoder_only=is_decoder_only,
-                batch_size=args.batch_val_size, num_beams=4
-            )
-            print(f"Initial ROUGE-1: {initial_r1:.2f}%, ROUGE-2: {initial_r2:.2f}%, ROUGE-L: {initial_rL:.2f}%")
-        except Exception as e:
-            print(f"[warn] Initial ROUGE evaluation skipped: {e}")
     elif args.dataset == "tweetqa" and not args.skip_all_eval:
         print("\n" + "="*60)
         print("INITIAL EVALUATION (EM + F1, before training)")
@@ -2266,30 +1480,16 @@ if __name__ == "__main__":
         print(f"[multi_csv] Enabled: will load epoch-specific CSVs from epoch {csv_start_epoch} to {csv_end_epoch}")
 
     history = {"train_loss": [], "train_metric": [], "val_metric": [], "train_f1": [], "val_f1": [], "metric_name": ""}
-    if args.dataset == "jfleg":
-        metric_name = "GLEU"
-    elif args.dataset in ["e2e_nlg", "personachat"]:
-        metric_name = "BLEU"
-    elif args.dataset == "dart":
-        metric_name = "BLEU"
-    elif args.dataset == "gsm8k":
-        metric_name = "EM"
-    elif args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa"]:
-        metric_name = "EM"
-    elif args.dataset == "samsum":
-        metric_name = "ROUGE-L"
-    else:  # wiki_auto
-        metric_name = "SARI"
+    metric_name = "EM"
     history["metric_name"] = metric_name
     
     val_eval_subset = None
     
-    # Best checkpoint tracking (for SQuAD: save best F1 model, for SAMSum: save best R-1 model)
-    best_val_metric = -float('inf')  # Track best validation metric (F1 for SQuAD, R-1 for SAMSum)
+    # Best checkpoint tracking (save best F1 model)
+    best_val_metric = -float('inf')  # Track best validation metric (F1)
     best_test_metric = -float('inf')  # Track best test metric (for TweetQA - unusual but per user request)
     best_epoch = 0
     best_model_state = None  # Store best model state dict in memory
-    augmented_train_examples = None  # Store augmented examples for reuse
 
     for epoch in range(1, total_epochs + 1):
         print("\n" + "="*60)
@@ -2311,7 +1511,6 @@ if __name__ == "__main__":
             else:
                 adversarial_variants = None
         
-        # Apply EDA augmentation for QA and SAMSum datasets AFTER warmup (only once)
         if epoch <= args.warmup_epochs:
             use_adversarial = False
             print(f"Training mode: Normal (warmup epoch {epoch}/{args.warmup_epochs})")
@@ -2350,183 +1549,7 @@ if __name__ == "__main__":
         if epoch == total_epochs:
             final_val_subset = val_eval_subset
 
-        if args.dataset == "jfleg":
-            if args.skip_all_eval:
-                train_g, val_g = 0.0, 0.0
-                history["train_metric"].append(train_g)
-                history["val_metric"].append(val_g)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                try:
-                    if args.skip_train_eval:
-                        train_g = 0.0
-                    else:
-                        train_g = evaluate_jfleg_gleu(model, tokenizer, train_eval_subset,
-                                                      max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                                      num_samples=len(train_eval_subset), debug=False, is_decoder_only=is_decoder_only)
-                    val_g = evaluate_jfleg_gleu(model, tokenizer, val_eval_subset,
-                                                max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                                num_samples=len(val_eval_subset), debug=False, is_decoder_only=is_decoder_only)
-                except Exception as e:
-                    print(f"[warn] GLEU eval failed: {e}")
-                    train_g, val_g = 0.0, 0.0
-                history["train_metric"].append(train_g)
-                history["val_metric"].append(val_g)
-                if args.skip_train_eval:
-                    print(f"Val GLEU: {val_g:.2f} (train eval skipped)")
-                else:
-                    print(f"Train GLEU: {train_g:.2f} | Val GLEU: {val_g:.2f}")
-
-        elif args.dataset == "e2e_nlg":
-            if args.skip_all_eval:
-                train_b, val_b = 0.0, 0.0
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                try:
-                    if args.skip_train_eval:
-                        train_b = 0.0
-                    else:
-                        train_b = evaluate_e2e_bleu(model, tokenizer, train_eval_subset,
-                                                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                                    num_samples=len(train_eval_subset), debug=False)
-                    val_b = evaluate_e2e_bleu(model, tokenizer, val_eval_subset,
-                                              max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                              num_samples=len(val_eval_subset), debug=False)
-                except Exception as e:
-                    print(f"[warn] BLEU eval failed: {e}")
-                    train_b, val_b = 0.0, 0.0
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                if args.skip_train_eval:
-                    print(f"Val BLEU: {val_b:.2f} (train eval skipped)")
-                else:
-                    print(f"Train BLEU: {train_b:.2f} | Val BLEU: {val_b:.2f}")
-        
-        elif args.dataset == "dart":
-            if args.skip_all_eval:
-                train_b, val_b = 0.0, 0.0
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                train_b, val_b = 0.0, 0.0
-                try:
-                    if args.skip_train_eval:
-                        train_b = 0.0
-                        print("[skip] Train evaluation skipped")
-                    else:
-                        print(f"[eval] Evaluating on {len(train_eval_subset)} training examples...")
-                        train_b = evaluate_dart_bleu(model, tokenizer, train_eval_subset,
-                                                     max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                                     num_samples=len(train_eval_subset), debug=False)
-                        print(f"[✓] Train BLEU computed: {train_b:.2f}")
-                except Exception as e:
-                    print(f"[✗] Train BLEU eval failed: {e}")
-                    train_b = 0.0
-                
-                try:
-                    print(f"[eval] Evaluating on {len(val_eval_subset)} validation examples...")
-                    val_b = evaluate_dart_bleu(model, tokenizer, val_eval_subset,
-                                               max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                                               num_samples=len(val_eval_subset), debug=False)
-                    print(f"[✓] Val BLEU computed: {val_b:.2f}")
-                except Exception as e:
-                    print(f"[✗] Val BLEU eval failed: {e}")
-                    val_b = 0.0
-                
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                if args.skip_train_eval:
-                    print(f"Val BLEU: {val_b:.2f} (train eval skipped)")
-                else:
-                    print(f"Train BLEU: {train_b:.2f} | Val BLEU: {val_b:.2f}")
-                
-                # Track best model based on val BLEU (save state in memory)
-                if val_b > best_val_metric:
-                    best_val_metric = val_b
-                    best_epoch = epoch
-                    # Store model state in memory (will save as final at end)
-                    from peft import get_peft_model_state_dict
-                    best_model_state = {k: v.cpu().clone() for k, v in get_peft_model_state_dict(model).items()}
-                    print(f"    [★] New best BLEU! (epoch {epoch}, BLEU={val_b:.2f}) - will save this as final model")
-        
-        elif args.dataset == "personachat":
-            if args.skip_all_eval:
-                train_b, val_b, train_f1, val_f1 = 0.0, 0.0, 0.0, 0.0
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                history["train_f1"].append(train_f1)
-                history["val_f1"].append(val_f1)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                try:
-                    if args.skip_train_eval:
-                        train_b, train_f1 = 0.0, 0.0
-                    else:
-                        train_b, train_f1 = evaluate_personachat_bleu(
-                            model, tokenizer, train_eval_subset,
-                            max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                            num_samples=len(train_eval_subset), max_hist_turns=3,
-                            debug=False, is_decoder_only=is_decoder_only, f1_only=args.f1_only
-                        )
-                    val_b, val_f1 = evaluate_personachat_bleu(
-                        model, tokenizer, val_eval_subset,
-                        max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                        num_samples=len(val_eval_subset), max_hist_turns=3,
-                        debug=False, is_decoder_only=is_decoder_only, f1_only=args.f1_only
-                    )
-                except Exception as e:
-                    print(f"[warn] Evaluation failed: {e}")
-                    train_b, val_b, train_f1, val_f1 = 0.0, 0.0, 0.0, 0.0
-                history["train_metric"].append(train_b)
-                history["val_metric"].append(val_b)
-                history["train_f1"].append(train_f1)
-                history["val_f1"].append(val_f1)
-                if args.f1_only:
-                    # F1-only mode
-                    if args.skip_train_eval:
-                        print(f"Val F1: {val_f1:.2f} (train eval skipped, BLEU skipped)")
-                    else:
-                        print(f"Train F1: {train_f1:.2f} | Val F1: {val_f1:.2f} (BLEU skipped)")
-                elif args.skip_train_eval:
-                    print(f"Val BLEU: {val_b:.2f} F1: {val_f1:.2f} (train eval skipped)")
-                else:
-                    print(f"Train BLEU: {train_b:.2f} F1: {train_f1:.2f} | Val BLEU: {val_b:.2f} F1: {val_f1:.2f}")
-        
-        elif args.dataset == "gsm8k":
-            if args.skip_all_eval:
-                train_em, val_em = 0.0, 0.0
-                history["train_metric"].append(train_em)
-                history["val_metric"].append(val_em)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                try:
-                    if args.skip_train_eval:
-                        train_em = 0.0
-                    else:
-                        train_em = evaluate_gsm8k_em(
-                            model, tokenizer, train_eval_subset,
-                            max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                            num_samples=len(train_eval_subset), debug=False, is_decoder_only=is_decoder_only
-                        )
-                    val_em = evaluate_gsm8k_em(
-                        model, tokenizer, val_eval_subset,
-                        max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                        num_samples=len(val_eval_subset), debug=False, is_decoder_only=is_decoder_only
-                    )
-                except Exception as e:
-                    print(f"[warn] EM eval failed: {e}")
-                    train_em, val_em = 0.0, 0.0
-                history["train_metric"].append(train_em)
-                history["val_metric"].append(val_em)
-                if args.skip_train_eval:
-                    print(f"Val EM: {val_em:.2f} (train eval skipped)")
-                else:
-                    print(f"Train EM: {train_em:.2f} | Val EM: {val_em:.2f}")
-        
-        elif args.dataset in ["squad", "adversarial_qa", "subjqa"]:
+        if args.dataset == "squad":
             if args.skip_all_eval:
                 train_em, train_f1, val_em, val_f1 = 0.0, 0.0, 0.0, 0.0
                 history["train_metric"].append(train_em)
@@ -2536,7 +1559,6 @@ if __name__ == "__main__":
                 print("[skip] All evaluation skipped for faster training")
             else:
                 try:
-                    dataset_label = "AdversarialQA" if args.dataset == "adversarial_qa" else "SQuAD"
                     if args.skip_train_eval:
                         train_em, train_f1 = 0.0, 0.0
                     else:
@@ -2544,16 +1566,16 @@ if __name__ == "__main__":
                             model, tokenizer, train_eval_subset,
                             max_src_len=args.max_length, max_gen_len=args.max_target_length,
                             num_samples=len(train_eval_subset), debug=False,
-                            dataset_name=dataset_label
+                            dataset_name="SQuAD"
                         )
                     val_em, val_f1 = evaluate_squad_em_f1(
                         model, tokenizer, val_eval_subset,
                         max_src_len=args.max_length, max_gen_len=args.max_target_length,
                         num_samples=len(val_eval_subset), debug=False,
-                        dataset_name=dataset_label
+                        dataset_name="SQuAD"
                     )
                 except Exception as e:
-                    print(f"[warn] {args.dataset} evaluation failed: {e}")
+                    print(f"[warn] squad evaluation failed: {e}")
                     train_em, train_f1, val_em, val_f1 = 0.0, 0.0, 0.0, 0.0
                 history["train_metric"].append(train_em)
                 history["val_metric"].append(val_em)
@@ -2572,50 +1594,6 @@ if __name__ == "__main__":
                     from peft import get_peft_model_state_dict
                     best_model_state = {k: v.cpu().clone() for k, v in get_peft_model_state_dict(model).items()}
                     print(f"    [★] New best F1! (epoch {epoch}, F1={val_f1:.2f}%) - will save this as final model")
-        
-        elif args.dataset == "samsum":
-            if args.skip_all_eval:
-                train_r1, train_r2, train_rL = 0.0, 0.0, 0.0
-                val_r1, val_r2, val_rL = 0.0, 0.0, 0.0
-                history["train_metric"].append(train_rL)
-                history["val_metric"].append(val_rL)
-                print("[skip] All evaluation skipped for faster training")
-            else:
-                try:
-                    if args.skip_train_eval:
-                        train_r1, train_r2, train_rL = 0.0, 0.0, 0.0
-                    else:
-                        train_r1, train_r2, train_rL = evaluate_samsum_rouge(
-                            model, tokenizer, train_eval_subset,
-                            max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                            num_samples=len(train_eval_subset), debug=False, is_decoder_only=is_decoder_only,
-                            batch_size=args.batch_val_size, num_beams=1
-                        )
-                    val_r1, val_r2, val_rL = evaluate_samsum_rouge(
-                        model, tokenizer, val_eval_subset,
-                        max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                        num_samples=len(val_eval_subset), debug=False, is_decoder_only=is_decoder_only,
-                        batch_size=args.batch_val_size, num_beams=1
-                    )
-                except Exception as e:
-                    print(f"[warn] ROUGE eval failed: {e}")
-                    train_r1, train_r2, train_rL = 0.0, 0.0, 0.0
-                    val_r1, val_r2, val_rL = 0.0, 0.0, 0.0
-                history["train_metric"].append(train_rL)
-                history["val_metric"].append(val_rL)
-                if args.skip_train_eval:
-                    print(f"Val ROUGE-1: {val_r1:.2f}%, R-2: {val_r2:.2f}%, R-L: {val_rL:.2f}% (train eval skipped)")
-                else:
-                    print(f"Train R-L: {train_rL:.2f}% | Val R-1: {val_r1:.2f}%, R-2: {val_r2:.2f}%, R-L: {val_rL:.2f}%")
-                
-                # Track best model based on val ROUGE-1 (save state in memory)
-                if val_r1 > best_val_metric:
-                    best_val_metric = val_r1
-                    best_epoch = epoch
-                    # Store model state in memory (will save as final at end)
-                    from peft import get_peft_model_state_dict
-                    best_model_state = {k: v.cpu().clone() for k, v in get_peft_model_state_dict(model).items()}
-                    print(f"    [★] New best ROUGE-1! (epoch {epoch}, R-1={val_r1:.2f}%) - will save this as final model")
         
         elif args.dataset == "tweetqa":
             if args.skip_all_eval:
@@ -2664,24 +1642,17 @@ if __name__ == "__main__":
         else:
             history["train_metric"].append(None)
             history["val_metric"].append(None)
-            if args.dataset in ["personachat", "squad", "adversarial_qa", "subjqa"]:
-                history["train_f1"].append(None)
-                history["val_f1"].append(None)
+            history["train_f1"].append(None)
+            history["val_f1"].append(None)
 
         #if (epoch % 2) == 0:
         #    ckpt_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}_seed_{args.seed}.pt")
         #    save_lora_gen_model(model, ckpt_path)
 
     # Add best epoch info to metrics
-    if args.dataset in ["squad", "adversarial_qa", "subjqa"] and best_epoch >= 1:
+    if args.dataset in ["squad", "tweetqa"] and best_epoch >= 1:
         history["best_epoch"] = best_epoch
         history["best_val_f1"] = best_val_metric
-    elif args.dataset == "samsum" and best_epoch >= 1:
-        history["best_epoch"] = best_epoch
-        history["best_val_rouge1"] = best_val_metric
-    elif args.dataset in ["dart", "e2e_nlg"] and best_epoch >= 1:
-        history["best_epoch"] = best_epoch
-        history["best_val_bleu"] = best_val_metric
     
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, f"metrics_seed_{args.seed}.json"), "w") as f:
@@ -2689,21 +1660,15 @@ if __name__ == "__main__":
     
     final_model_path = os.path.join(output_dir, f"model_seed_{args.seed}.pt")
     
-    # Save model: best checkpoint for QA/SAMSum/DART (if eval enabled), otherwise final epoch
-    if args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa", "samsum", "dart", "e2e_nlg"] and best_epoch >= 1 and best_model_state is not None and not args.skip_all_eval:
-        # For QA/SAMSum/text-gen with eval enabled: restore and save best model
-        if args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa"]:
-            metric_name = "F1"
-        elif args.dataset == "samsum":
-            metric_name = "ROUGE-1"
-        else:  # dart, e2e_nlg, personachat, jfleg
-            metric_name = "BLEU" if args.dataset in ["dart", "e2e_nlg"] else "GLEU"
+    # Save model: best checkpoint (if eval enabled), otherwise final epoch
+    if args.dataset in ["squad", "tweetqa"] and best_epoch >= 1 and best_model_state is not None and not args.skip_all_eval:
+        # Restore and save best model
+        metric_name = "F1"
         print(f"\n{'='*60}")
         print(f"[★] SAVING BEST MODEL (not final epoch)")
         print(f"[★] Best performance: Epoch {best_epoch}/{total_epochs} with {metric_name}={best_val_metric:.2f}")
         print(f"{'='*60}")
         from peft import set_peft_model_state_dict
-        # Restore best state to model
         best_model_state_gpu = {k: v.to(next(model.parameters()).device) for k, v in best_model_state.items()}
         set_peft_model_state_dict(model, best_model_state_gpu)
         save_lora_gen_model(model, final_model_path)
@@ -2729,14 +1694,14 @@ if __name__ == "__main__":
         last_val_metric = history["val_metric"][-1] if history["val_metric"] else None
         last_val_f1 = history["val_f1"][-1] if history.get("val_f1") else None
         
-        # For QA/SAMSum: compare against best epoch, not last epoch
-        if args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa", "samsum"] and best_epoch >= 1 and not args.skip_all_eval:
+        # For squad/tweetqa: compare against best epoch, not last epoch
+        if args.dataset in ["squad", "tweetqa"] and best_epoch >= 1 and not args.skip_all_eval:
             expected_metric = best_val_metric
             expected_epoch = best_epoch
-            metric_name = "F1" if args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa"] else "ROUGE-1"
-            print(f"Comparing against BEST epoch {best_epoch} ({metric_name}={best_val_metric:.2f}%)")
+            metric_name = "F1"
+            print(f"Comparing against BEST epoch {best_epoch} (F1={best_val_metric:.2f}%)")
         else:
-            expected_metric = last_val_f1 if args.dataset in ["squad", "adversarial_qa", "subjqa"] else last_val_metric
+            expected_metric = last_val_f1 if args.dataset in ["squad", "tweetqa"] else last_val_metric
             expected_epoch = total_epochs
         
         loaded_model = load_lora_gen_model(
@@ -2757,96 +1722,13 @@ if __name__ == "__main__":
         
         loaded_metric = None
         verification_status = "UNKNOWN"
-        if args.dataset == "jfleg":
-            try:
-                loaded_metric = evaluate_jfleg_gleu(
-                    loaded_model, tokenizer, test_subset,
-                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                    num_samples=len(test_subset), debug=False, is_decoder_only=is_decoder_only
-                )
-                print(f"\nPerformance Comparison (EXACT same {len(test_subset)} samples):")
-                print(f"    Last training Val GLEU: {last_val_metric:.2f}" if last_val_metric else "    Last training Val GLEU: N/A")
-                print(f"    Loaded model GLEU: {loaded_metric:.2f}")
-                if last_val_metric and abs(loaded_metric - last_val_metric) > 2.0:
-                    print(f"    [⚠] PERFORMANCE MISMATCH! Difference: {abs(loaded_metric - last_val_metric):.2f}")
-                    verification_status = "FAILED - Performance Mismatch"
-                elif last_val_metric and abs(loaded_metric - last_val_metric) > 0.5:
-                    print(f"    [⚠] Minor performance difference: {abs(loaded_metric - last_val_metric):.2f}")
-                    verification_status = "PARTIAL - Minor Mismatch"
-                else:
-                    print(f"    [✓] Performance preserved within acceptable range")
-                    verification_status = "SUCCESSFUL"
-            except Exception as e:
-                print(f"[⚠] GLEU evaluation failed: {e}")
-                verification_status = "PARTIAL - Load OK, Eval Failed"
-        elif args.dataset == "e2e_nlg":
-            try:
-                loaded_metric = evaluate_e2e_bleu(
-                    loaded_model, tokenizer, test_subset,
-                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                    num_samples=len(test_subset), debug=False
-                )
-                print(f"\nPerformance Comparison:")
-                print(f"    Last training Val BLEU: {last_val_metric:.2f}" if last_val_metric else "    Last training Val BLEU: N/A")
-                print(f"    Loaded model BLEU: {loaded_metric:.2f}")
-                if last_val_metric and abs(loaded_metric - last_val_metric) > 3.0:
-                    print(f"    [⚠] PERFORMANCE MISMATCH! Difference: {abs(loaded_metric - last_val_metric):.2f}")
-                    verification_status = "FAILED - Performance Mismatch"
-                else:
-                    print(f"    [✓] Performance preserved within acceptable range")
-                    verification_status = "SUCCESSFUL"
-            except Exception as e:
-                print(f"[⚠] BLEU evaluation failed: {e}")
-                verification_status = "PARTIAL - Load OK, Eval Failed"
-        elif args.dataset == "dart":
-            try:
-                loaded_metric = evaluate_dart_bleu(
-                    loaded_model, tokenizer, test_subset,
-                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                    num_samples=len(test_subset), debug=False
-                )
-                print(f"\nPerformance Comparison:")
-                print(f"    Last training Val BLEU: {last_val_metric:.2f}" if last_val_metric else "    Last training Val BLEU: N/A")
-                print(f"    Loaded model BLEU: {loaded_metric:.2f}")
-                if last_val_metric and abs(loaded_metric - last_val_metric) > 3.0:
-                    print(f"    [⚠] PERFORMANCE MISMATCH! Difference: {abs(loaded_metric - last_val_metric):.2f}")
-                    verification_status = "FAILED - Performance Mismatch"
-                else:
-                    print(f"    [✓] Performance preserved within acceptable range")
-                    verification_status = "SUCCESSFUL"
-            except Exception as e:
-                print(f"[⚠] BLEU evaluation failed: {e}")
-                verification_status = "PARTIAL - Load OK, Eval Failed"
-        elif args.dataset == "personachat":
-            try:
-                loaded_bleu, loaded_f1 = evaluate_personachat_bleu(
-                    loaded_model, tokenizer, test_subset,
-                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                    num_samples=len(test_subset), max_hist_turns=3, 
-                    debug=False, is_decoder_only=is_decoder_only, f1_only=args.f1_only
-                )
-                print(f"\nPerformance Comparison:")
-                if args.f1_only:
-                    print(f"    Loaded model F1: {loaded_f1:.2f} (BLEU skipped)")
-                else:
-                    print(f"    Last training Val BLEU: {last_val_metric:.2f}" if last_val_metric else "    Last training Val BLEU: N/A")
-                    print(f"    Loaded model BLEU: {loaded_bleu:.2f} | F1: {loaded_f1:.2f}")
-                if (not args.f1_only) and last_val_metric and abs(loaded_bleu - last_val_metric) > 2.0:
-                    print(f"    [⚠] PERFORMANCE MISMATCH! Difference: {abs(loaded_bleu - last_val_metric):.2f}")
-                    verification_status = "FAILED - Performance Mismatch"
-                else:
-                    print(f"    [✓] Performance preserved within acceptable range")
-                    verification_status = "SUCCESSFUL"
-            except Exception as e:
-                print(f"[⚠] Evaluation failed: {e}")
-                verification_status = "PARTIAL - Load OK, Eval Failed"
-        elif args.dataset in ["squad", "adversarial_qa", "subjqa", "tweetqa"]:
+        if args.dataset in ["squad", "tweetqa"]:
             try:
                 loaded_em, loaded_f1 = evaluate_squad_em_f1(
                     loaded_model, tokenizer, test_subset,
                     max_src_len=args.max_length, max_gen_len=args.max_target_length,
                     num_samples=len(test_subset), debug=False,
-                    dataset_name="AdversarialQA" if args.dataset == "adversarial_qa" else "SQuAD"
+                    dataset_name="SQuAD"
                 ) if args.dataset != "tweetqa" else evaluate_tweetqa_em_f1(
                     loaded_model, tokenizer, test_subset,
                     max_src_len=args.max_length, max_gen_len=args.max_target_length,
@@ -2872,35 +1754,6 @@ if __name__ == "__main__":
                     verification_status = "SUCCESSFUL"
             except Exception as e:
                 print(f"[⚠] {args.dataset} evaluation failed: {e}")
-                verification_status = "PARTIAL - Load OK, Eval Failed"
-        elif args.dataset == "samsum":
-            try:
-                loaded_r1, loaded_r2, loaded_rL = evaluate_samsum_rouge(
-                    loaded_model, tokenizer, test_subset,
-                    max_src_len=args.max_length, max_gen_len=args.max_target_length,
-                    num_samples=len(test_subset), debug=False, is_decoder_only=is_decoder_only,
-                    batch_size=args.batch_val_size, num_beams=1
-                )
-                print(f"\nPerformance Comparison (SAMSum):")
-                if best_epoch > 0 and not args.skip_all_eval:
-                    print(f"    Best epoch {best_epoch} Val ROUGE-1: {best_val_metric:.2f}%")
-                else:
-                    print(f"    Last training Val ROUGE-1: {last_val_metric:.2f}%" if last_val_metric else "    Last training Val ROUGE-1: N/A")
-                print(f"    Loaded model R-1: {loaded_r1:.2f}%, R-2: {loaded_r2:.2f}%, R-L: {loaded_rL:.2f}%")
-                
-                # Compare against best epoch or last epoch
-                compare_r1 = best_val_metric if (best_epoch > 0 and not args.skip_all_eval) else (last_val_metric or 0)
-                if compare_r1 and abs(loaded_r1 - compare_r1) > 2.0:
-                    print(f"    [⚠] PERFORMANCE MISMATCH! Difference: {abs(loaded_r1 - compare_r1):.2f}%")
-                    verification_status = "FAILED - Performance Mismatch"
-                elif compare_r1 and abs(loaded_r1 - compare_r1) > 0.5:
-                    print(f"    [⚠] Minor performance difference: {abs(loaded_r1 - compare_r1):.2f}%")
-                    verification_status = "PARTIAL - Minor Mismatch"
-                else:
-                    print(f"    [✓] Performance preserved within acceptable range")
-                    verification_status = "SUCCESSFUL"
-            except Exception as e:
-                print(f"[⚠] SAMSum evaluation failed: {e}")
                 verification_status = "PARTIAL - Load OK, Eval Failed"
         else:
             verification_status = "SUCCESSFUL - Basic Load Test"
