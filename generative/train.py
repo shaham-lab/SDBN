@@ -57,17 +57,6 @@ def set_random_seed(seed: int):
     except Exception:
         pass
 
-def _try_make(path: str) -> bool:
-    try:
-        os.makedirs(path, exist_ok=True)
-        test_file = os.path.join(path, ".write_test")
-        with open(test_file, "w") as f:
-            f.write("ok")
-        os.remove(test_file)
-        return True
-    except Exception:
-        return False
-
 def resolve_output_dir(args) -> str:
     rel = os.path.join(
         "results", "SDBN-P", args.dataset, args.model_name,
@@ -373,19 +362,6 @@ def eval_mode(m):
     finally:
         if was_training:
             m.train()
-
-def _tokenize_for_sari(text: str) -> List[str]:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return [t for t in text.split()]
-
-def _ngrams(tokens: List[str], n: int) -> set:
-    return set(tuple(tokens[i:i+n]) for i in range(0, max(0, len(tokens) - n + 1)))
-
-def _f1(p: float, r: float) -> float:
-    if p == 0 and r == 0:
-        return 0.0
-    return 2 * p * r / (p + r)
 
 def normalize_answer(s: str) -> str:
     """Normalize answer text for SQuAD evaluation"""
@@ -883,8 +859,7 @@ def select_max_loss_variant(model, tokenizer, variants, device, is_decoder_only=
 def train_one_epoch(model, train_dataloader, optimizer, scheduler, device, epoch, max_grad_norm=1.0,
                    use_adversarial=False, perturbation_type='sdbn-p',
                    adversarial_variants=None, tokenizer=None,
-                   max_source_len=512, max_target_len=128, dataset='squad', mem_peak_scope: str = 'epoch',
-                   clean_inputs_dict=None):
+                   max_source_len=512, max_target_len=128, dataset='squad', mem_peak_scope: str = 'epoch'):
     # Clear GPU cache before training epoch
         
     model.train()
@@ -1159,8 +1134,6 @@ def parse_args():
     )
     p.add_argument("--max_length", type=int, default=128)
     p.add_argument("--max_target_length", type=int, default=32)
-    p.add_argument("--train_multi_ref", action="store_true", default=True)
-    p.add_argument("--refs_per_ex", type=int, default=4)
 
     p.add_argument("--batch_train_size", type=int, default=16)
     p.add_argument("--batch_val_size", type=int, default=200)
@@ -1169,15 +1142,11 @@ def parse_args():
     p.add_argument("--device", type=int, default=0)
 
     p.add_argument("--output_dir", type=str, default=None)
-    p.add_argument("--public_server", "-ps", action="store_true", default=False)
     p.add_argument("--fixed_val_size", type=int, default=500)
-    p.add_argument("--debug_eval", action="store_true", default=False)
     p.add_argument("--skip_train_eval", action="store_true", default=False,
                     help="Skip performance evaluation on train set (faster training)")
     p.add_argument("--skip_all_eval", action="store_true", default=False,
                     help="Skip ALL evaluation (train and val) for fastest training")
-    p.add_argument("--f1_only", action="store_true", default=False,
-                    help="For PersonaChat: compute only F1, skip BLEU (faster)")
     p.add_argument("--save_trainset", action="store_true", default=False,
                     help="Save training dataset to CSV in output directory")
     p.add_argument("--not_overwrite", action="store_true", default=False,
@@ -1235,7 +1204,6 @@ if __name__ == "__main__":
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  Train batch size: {args.batch_train_size}")
     print(f"  Max src len: {args.max_length} | Max tgt len: {args.max_target_length}")
-    print(f"  Multi-ref training: {args.train_multi_ref} (refs_per_ex={args.refs_per_ex})")
 
     # Load tokenizer and model based on architecture
     tokenizer = AutoTokenizer.from_pretrained(model_full_name, token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
@@ -1316,15 +1284,6 @@ if __name__ == "__main__":
     else:
         fixed_val_eval = val_examples[:min(args.fixed_val_size, len(val_examples))]
 
-    # Create fixed test eval subset for datasets with test sets (TweetQA)
-    fixed_test_eval = None
-    if test_examples is not None:
-        print(f"Test examples: {len(test_examples)}")
-        if hasattr(test_examples, 'select'):
-            fixed_test_eval = test_examples.select(range(min(args.fixed_val_size, len(test_examples))))
-        else:
-            fixed_test_eval = test_examples[:min(args.fixed_val_size, len(test_examples))]
-
     if hasattr(train_examples, 'shuffle'):
         train_examples = train_examples.shuffle(seed=args.seed)
     if hasattr(val_examples, 'shuffle'):
@@ -1358,13 +1317,6 @@ if __name__ == "__main__":
             max_source_len=args.max_length,
             max_target_len=args.max_target_length
         )
-        # Preprocess test set if available
-        if test_examples is not None:
-            te_data = preprocess_tweetqa_for_decoder(
-                test_examples, tokenizer,
-                max_source_len=args.max_length,
-                max_target_len=args.max_target_length
-            )
         train_ds = TweetQADataset(tr_data)
         val_ds = TweetQADataset(va_data)
     else:
@@ -1413,21 +1365,16 @@ if __name__ == "__main__":
     g = torch.Generator()
     g.manual_seed(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch_train_size, shuffle=True, generator=g)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_val_size, shuffle=False)
 
     lr = args.learning_rate
     all_params = [p for p in model.parameters() if p.requires_grad]
     print(f"trainable params: {sum(p.numel() for p in all_params):,} || all params: {sum(p.numel() for p in model.parameters()):,} || trainable%: {100.0*sum(p.numel() for p in all_params)/max(1,sum(p.numel() for p in model.parameters())):.4f}")
     
     optimizer_all = torch.optim.AdamW(all_params, lr=lr, weight_decay=0.01)
-    optimizer_enc = None
-    optimizer_dec = optimizer_all
 
     total_steps = len(train_loader) * total_epochs
     warmup_steps = int(0.05 * total_steps)
     sched_all = get_linear_schedule_with_warmup(optimizer_all, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-    sched_enc = None
-    sched_dec = sched_all
     print("\nOptimization setup:")
     print(f"  LR: {lr} | total_steps: {total_steps} | warmup_steps: {warmup_steps} | steps/epoch: {len(train_loader)}")
 
@@ -1467,7 +1414,6 @@ if __name__ == "__main__":
     # For single CSV mode, load once before training loop
     # For multi-CSV mode, will load per-epoch inside the loop
     adversarial_variants = None
-    clean_inputs_dict = None
     if args.perturbation in 'sdbn-p' and not args.multi_csv:
         adversarial_variants = load_adversarial_csv(output_dir, args)
     
@@ -1487,7 +1433,6 @@ if __name__ == "__main__":
     
     # Best checkpoint tracking (save best F1 model)
     best_val_metric = -float('inf')  # Track best validation metric (F1)
-    best_test_metric = -float('inf')  # Track best test metric (for TweetQA - unusual but per user request)
     best_epoch = 0
     best_model_state = None  # Store best model state dict in memory
 
@@ -1535,7 +1480,6 @@ if __name__ == "__main__":
             max_target_len=args.max_target_length,
             dataset=args.dataset,
             mem_peak_scope=args.mem_peak_scope,
-            clean_inputs_dict=clean_inputs_dict,
         )
 
         # Keep a simple, stable summary line (GiB).
@@ -1709,7 +1653,6 @@ if __name__ == "__main__":
             model_full_name,
             lora_rank=args.lora_rank,
             device=original_device,
-            freeze_encoder=False
         )
         
         print("Testing loaded model performance on EXACT same samples as last epoch...")
